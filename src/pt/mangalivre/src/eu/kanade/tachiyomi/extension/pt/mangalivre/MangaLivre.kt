@@ -44,7 +44,6 @@ class MangaLivre :
 
     private val scrapeClient: OkHttpClient by lazy {
         network.client.newBuilder()
-            .followRedirects(false)
             .build()
     }
 
@@ -196,7 +195,7 @@ class MangaLivre :
         val response = chain.proceed(
             request.newBuilder().header(CLIENT_HEADER, currentClientValue()).build(),
         )
-        if (response.code != 403 || !response.isOfficialAppError()) {
+        if (response.code != 403) {
             return response
         }
 
@@ -216,8 +215,10 @@ class MangaLivre :
 
     private fun scrapeClientValue(): String {
         return try {
-            val html = scrapeClient.newCall(GET("$baseUrl/index.html", headers)).execute()
-                .use { if (it.isSuccessful) it.body?.string().orEmpty() else "" }
+            val html = listOf("$baseUrl/", "$baseUrl/index.html").firstNotNullOfOrNull { url ->
+                scrapeClient.newCall(GET(url, headers)).execute()
+                    .use { if (it.isSuccessful) it.body?.string()?.takeIf { s -> s.isNotBlank() } else null }
+            } ?: return DEFAULT_CLIENT
             val assetPath = ASSET_REGEX.find(html)?.value ?: return DEFAULT_CLIENT
             val js = scrapeClient.newCall(GET("$baseUrl$assetPath", headers)).execute()
                 .use { if (it.isSuccessful) it.body?.string() else null }
@@ -232,23 +233,15 @@ class MangaLivre :
         ANCHORED_REGEX.find(js)?.let { return it.groupValues[1] }
         return SHAPE_REGEX.findAll(js)
             .map { it.groupValues[1] }
-            .toSet()
-            .singleOrNull()
-    }
-
-    private fun Response.isOfficialAppError(): Boolean = try {
-        peekBody(MAX_PEEK).string().contains("aplicativo oficial", ignoreCase = true)
-    } catch (_: Exception) {
-        false
+            .firstOrNull()
     }
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val CLIENT_HEADER = "x-toonlivre-client"
+        private const val CLIENT_HEADER = "x-tly-sec"
         private const val DEFAULT_CLIENT = "web-x"
-        private const val MAX_PEEK = 1024L
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        private val ANCHORED_REGEX = Regex("\"x-toonlivre-client\"\\s*,\\s*\"([\\w.-]+)\"")
+        private val ANCHORED_REGEX = Regex("\"x-tly-sec\"\\s*,\\s*\"([\\w.-]+)\"")
         private val SHAPE_REGEX = Regex("\"(web-[a-z0-9]+)\"")
     }
 }
