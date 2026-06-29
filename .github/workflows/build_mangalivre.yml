@@ -32,19 +32,18 @@ jobs:
             -keysize 2048 \
             -validity 3650
 
+      - name: Apply code formatting
+        run: |
+          chmod +x gradlew
+          ./gradlew :src:pt:mangalivre:spotlessApply --no-daemon
+
       - name: Build MangaLivre
         env:
           ALIAS: mihon
           KEY_STORE_PASSWORD: mihon123
           KEY_PASSWORD: mihon123
         run: |
-          chmod +x gradlew
-          ./gradlew :src:pt:mangalivre:assembleRelease \
-            --no-daemon \
-            --stacktrace
-
-      - name: Find APK
-        run: find . -name "*.apk" | head -20
+          ./gradlew :src:pt:mangalivre:assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
