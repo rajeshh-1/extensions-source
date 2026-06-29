@@ -184,7 +184,7 @@ class MangaLivre :
     // ============================== Helper =======================================
 
     @Volatile
-    private var cachedClientValue: String? = null
+    private var cachedClientHeader: Pair<String, String>? = null
 
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -192,56 +192,62 @@ class MangaLivre :
             return chain.proceed(request)
         }
 
+        val (headerName, headerValue) = currentClientHeader()
         val response = chain.proceed(
-            request.newBuilder().header(CLIENT_HEADER, currentClientValue()).build(),
+            request.newBuilder().header(headerName, headerValue).build(),
         )
         if (response.code != 403) {
             return response
         }
 
         response.close()
+        val (newName, newValue) = refreshClientHeader()
         return chain.proceed(
-            request.newBuilder().header(CLIENT_HEADER, refreshClientValue()).build(),
+            request.newBuilder().header(newName, newValue).build(),
         )
     }
 
-    private fun currentClientValue(): String = cachedClientValue ?: synchronized(this) {
-        cachedClientValue ?: scrapeClientValue().also { cachedClientValue = it }
+    private fun currentClientHeader(): Pair<String, String> = cachedClientHeader ?: synchronized(this) {
+        cachedClientHeader ?: scrapeClientHeader().also { cachedClientHeader = it }
     }
 
-    private fun refreshClientValue(): String = synchronized(this) {
-        scrapeClientValue().also { cachedClientValue = it }
+    private fun refreshClientHeader(): Pair<String, String> = synchronized(this) {
+        scrapeClientHeader().also { cachedClientHeader = it }
     }
 
-    private fun scrapeClientValue(): String {
+    private fun scrapeClientHeader(): Pair<String, String> {
         return try {
             val html = listOf("$baseUrl/", "$baseUrl/index.html").firstNotNullOfOrNull { url ->
                 scrapeClient.newCall(GET(url, headers)).execute()
                     .use { if (it.isSuccessful) it.body?.string()?.takeIf { s -> s.isNotBlank() } else null }
-            } ?: return DEFAULT_CLIENT
-            val assetPath = ASSET_REGEX.find(html)?.value ?: return DEFAULT_CLIENT
+            } ?: return DEFAULT_HEADER
+            val assetPath = ASSET_REGEX.find(html)?.value ?: return DEFAULT_HEADER
             val js = scrapeClient.newCall(GET("$baseUrl$assetPath", headers)).execute()
                 .use { if (it.isSuccessful) it.body?.string() else null }
-                ?: return DEFAULT_CLIENT
-            extractClientValue(js) ?: DEFAULT_CLIENT
+                ?: return DEFAULT_HEADER
+            extractClientHeader(js) ?: DEFAULT_HEADER
         } catch (_: Exception) {
-            DEFAULT_CLIENT
+            DEFAULT_HEADER
         }
     }
 
-    private fun extractClientValue(js: String): String? {
-        ANCHORED_REGEX.find(js)?.let { return it.groupValues[1] }
-        return SHAPE_REGEX.findAll(js)
-            .map { it.groupValues[1] }
-            .firstOrNull()
+    private fun extractClientHeader(js: String): Pair<String, String>? {
+        // Captura dinamicamente qualquer header x-* com valor web-XXXX que o site configurar
+        DYNAMIC_REGEX.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
+        // Fallback: mantém o último header conhecido com o valor encontrado
+        val value = SHAPE_REGEX.findAll(js).map { it.groupValues[1] }.firstOrNull()
+            ?: return null
+        return FALLBACK_HEADER to value
     }
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val CLIENT_HEADER = "x-app-key"
+        private const val FALLBACK_HEADER = "x-app-key"
         private const val DEFAULT_CLIENT = "web-x"
+        private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        private val ANCHORED_REGEX = Regex("\"x-app-key\"\\s*,\\s*\"([\\w.-]+)\"")
+        // Captura o nome do header e o valor juntos: .set("x-qualquer-coisa","web-xyz")
+        private val DYNAMIC_REGEX = Regex("\\.set\\(\"(x-[\\w-]+)\",\"(web-[a-z0-9]+)\"\\)")
         private val SHAPE_REGEX = Regex("\"(web-[a-z0-9]+)\"")
     }
 }
