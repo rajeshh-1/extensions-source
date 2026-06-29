@@ -238,10 +238,10 @@ class MangaLivre :
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val CLIENT_HEADER = "x-tly-sec"
+        private const val CLIENT_HEADER = "x-app-key"
         private const val DEFAULT_CLIENT = "web-x"
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        private val ANCHORED_REGEX = Regex("\"x-tly-sec\"\\s*,\\s*\"([\\w.-]+)\"")
+        private val ANCHORED_REGEX = Regex("\"x-app-key\"\\s*,\\s*\"([\\w.-]+)\"")
         private val SHAPE_REGEX = Regex("\"(web-[a-z0-9]+)\"")
     }
 }
