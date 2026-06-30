@@ -232,9 +232,11 @@ class MangaLivre :
     }
 
     private fun extractClientHeader(js: String): Pair<String, String>? {
-        // Captura dinamicamente qualquer header x-* com valor web-XXXX que o site configurar
+        // Captura .append("x-tly-token","v99-web-z") ou qualquer variante futura
         DYNAMIC_REGEX.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
-        // Fallback: mantém o último header conhecido com o valor encontrado
+        // Fallback .set("x-qualquer","web-xyz") - formato anterior do site
+        DYNAMIC_REGEX_SET.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
+        // Ultimo recurso: extrai so o valor e usa o header fallback conhecido
         val value = SHAPE_REGEX.findAll(js).map { it.groupValues[1] }.firstOrNull()
             ?: return null
         return FALLBACK_HEADER to value
@@ -242,12 +244,15 @@ class MangaLivre :
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val FALLBACK_HEADER = "x-app-key"
-        private const val DEFAULT_CLIENT = "web-x"
+        private const val FALLBACK_HEADER = "x-tly-token"
+        private const val DEFAULT_CLIENT = "v99-web-z"
         private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        // Captura o nome do header e o valor juntos: .set("x-qualquer-coisa","web-xyz")
-        private val DYNAMIC_REGEX = Regex("\\.set\\(\"(x-[\\w-]+)\",\"(web-[a-z0-9]+)\"\\)")
-        private val SHAPE_REGEX = Regex("\"(web-[a-z0-9]+)\"")
+        // Formato atual: S.append("x-tly-token","v99-web-z") — valor pode ser vNN-web-ZZZ
+        private val DYNAMIC_REGEX = Regex("\\.append\\(\"(x-[\\w-]+)\",\"([^\"]+)\"\\)")
+        // Formato anterior: .set("x-app-key","web-xyz")
+        private val DYNAMIC_REGEX_SET = Regex("\\.set\\(\"(x-[\\w-]+)\",\"([^\"]+)\"\\)")
+        // Extrai qualquer token no formato web-xyz ou vNN-web-xyz
+        private val SHAPE_REGEX = Regex("\"((?:v\\d+-)?web-[a-z0-9-]+)\"")
     }
 }
