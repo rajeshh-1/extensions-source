@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.pt.mangalivre
 
+import android.util.Base64
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -232,11 +233,19 @@ class MangaLivre :
     }
 
     private fun extractClientHeader(js: String): Pair<String, String>? {
-        // Captura .append("x-tly-token","v99-web-z") ou qualquer variante futura
+        // Formato atual: S.append(atob("BASE64_NAME"), atob("BASE64_VALUE"))
+        ATOB_REGEX.find(js)?.let { m ->
+            runCatching {
+                val name  = Base64.decode(m.groupValues[1], Base64.DEFAULT).toString(Charsets.UTF_8)
+                val value = Base64.decode(m.groupValues[2], Base64.DEFAULT).toString(Charsets.UTF_8)
+                return name to value
+            }
+        }
+        // Formato anterior: S.append("x-tly-token","v99-web-z")
         DYNAMIC_REGEX.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
-        // Fallback .set("x-qualquer","web-xyz") - formato anterior do site
+        // Formato ainda anterior: .set("x-app-key","web-xyz")
         DYNAMIC_REGEX_SET.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
-        // Ultimo recurso: extrai so o valor e usa o header fallback conhecido
+        // Ultimo recurso: extrai o valor e usa o header fallback conhecido
         val value = SHAPE_REGEX.findAll(js).map { it.groupValues[1] }.firstOrNull()
             ?: return null
         return FALLBACK_HEADER to value
@@ -244,15 +253,17 @@ class MangaLivre :
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val FALLBACK_HEADER = "x-tly-token"
-        private const val DEFAULT_CLIENT = "v99-web-z"
+        private const val FALLBACK_HEADER = "app-sec-token"
+        private const val DEFAULT_CLIENT = "z11-web-y"
         private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        // Formato atual: S.append("x-tly-token","v99-web-z") — valor pode ser vNN-web-ZZZ
+        // Formato atual (ofuscado): S.append(atob("BASE64")‚ atob("BASE64"))
+        private val ATOB_REGEX = Regex("""\.append\(atob\("([A-Za-z0-9+/=]+)"\),\s*atob\("([A-Za-z0-9+/=]+)"\)\)""")
+        // Formato intermediario: S.append("x-tly-token","v99-web-z")
         private val DYNAMIC_REGEX = Regex("\\.append\\(\"(x-[\\w-]+)\",\"([^\"]+)\"\\)")
         // Formato anterior: .set("x-app-key","web-xyz")
         private val DYNAMIC_REGEX_SET = Regex("\\.set\\(\"(x-[\\w-]+)\",\"([^\"]+)\"\\)")
-        // Extrai qualquer token no formato web-xyz ou vNN-web-xyz
-        private val SHAPE_REGEX = Regex("\"((?:v\\d+-)?web-[a-z0-9-]+)\"")
+        // Extrai token no formato web-xyz ou vNN-web-xyz ou zNN-web-y
+        private val SHAPE_REGEX = Regex("\"([a-z][0-9]+-web-[a-z0-9-]+)\"")
     }
 }
