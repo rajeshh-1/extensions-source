@@ -52,10 +52,10 @@ class MangaLivre :
     private val scrapeClientWithIp: OkHttpClient by lazy {
         network.client.newBuilder()
             .dns { hostname ->
-                if (hostname == baseUrlHost) {
-                    CF_IPS.map { java.net.InetAddress.getByName(it) }
-                } else {
-                    okhttp3.Dns.SYSTEM.lookup(hostname)
+                when {
+                    hostname == baseUrlHost -> CF_IPS.map { java.net.InetAddress.getByName(it) }
+                    hostname == "mangalivre.net" -> ML_CF_IPS.map { java.net.InetAddress.getByName(it) }
+                    else -> okhttp3.Dns.SYSTEM.lookup(hostname)
                 }
             }
             .build()
@@ -252,27 +252,35 @@ class MangaLivre :
 
     // Melhoria 1: multiplos fallbacks para buscar a homepage
     private fun fetchHomepage(): String? {
-        val urls = listOf("$baseUrl/", "$baseUrl/index.html")
-
-        // Tentativa 1 e 2: cliente normal com URLs alternativas
-        for (url in urls) {
+        // Tentativa nos dois dominios — toonlivre.net pode redirecionar, tenta tambem mangalivre.net
+        val candidateUrls = listOf(
+            "$baseUrl/",
+            "$baseUrl/index.html",
+            "https://mangalivre.net/",
+            "https://mangalivre.net/index.html",
+        )
+        for (url in candidateUrls) {
             runCatching {
                 scrapeClient.newCall(GET(url, scrapeHomepageHeaders)).execute()
                     .use { resp ->
                         if (resp.isSuccessful) {
-                            resp.body?.string()?.takeIf(String::isNotBlank)?.let { return it }
+                            resp.body?.string()
+                                ?.takeIf { it.contains("/assets/index-") }
+                                ?.let { return it }
                         }
                     }
             }
         }
 
-        // Tentativa 3: DNS fixo nos IPs do Cloudflare (bypassa redirect DNS corporativo)
-        for (url in urls) {
+        // Tentativa com DNS fixo nos IPs do Cloudflare (bypassa redirect DNS corporativo)
+        for (url in candidateUrls) {
             runCatching {
                 scrapeClientWithIp.newCall(GET(url, scrapeHomepageHeaders)).execute()
                     .use { resp ->
                         if (resp.isSuccessful) {
-                            resp.body?.string()?.takeIf(String::isNotBlank)?.let { return it }
+                            resp.body?.string()
+                                ?.takeIf { it.contains("/assets/index-") }
+                                ?.let { return it }
                         }
                     }
             }
@@ -284,7 +292,12 @@ class MangaLivre :
         return try {
             val html = fetchHomepage() ?: return DEFAULT_HEADER
             val assetPath = ASSET_REGEX.find(html)?.value ?: return DEFAULT_HEADER
-            val js = scrapeClient.newCall(GET("$baseUrl$assetPath", headers)).execute()
+            // Determina o dominio de origem do asset baseado na URL da homepage encontrada
+            val assetBase = when {
+                html.contains("mangalivre.net") && !html.contains("toonlivre.net") -> "https://mangalivre.net"
+                else -> baseUrl
+            }
+            val js = scrapeClient.newCall(GET("$assetBase$assetPath", headers)).execute()
                 .use { if (it.isSuccessful) it.body?.string() else null }
                 ?: return DEFAULT_HEADER
             val candidate = extractClientHeader(js) ?: return DEFAULT_HEADER
@@ -437,12 +450,14 @@ class MangaLivre :
         private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
         // IPs fixos do Cloudflare para toonlivre.net — usados como fallback de DNS
         private val CF_IPS = listOf("104.21.35.220", "172.67.180.59")
+        // IPs do Cloudflare para mangalivre.net (dominio alternativo de fallback para scraping)
+        private val ML_CF_IPS = listOf("104.21.1.168", "172.67.129.165")
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
 
         // --- Decoders para cada tecnica de ofuscacao ---
 
         // Charcode: [120,45,...].map(G=>String.fromCharCode(G)).join("")
-        private val CHARCODE_REGEX = Regex("""\[(\d+(?:,\s*\d+)+)\]\.map\(\w+=>[^)]*fromCharCode[^)]*\)\.join\(""\)""")
+        private val CHARCODE_REGEX = Regex("""\[(\d+(?:,\d+)+)\]\.map\(\w+=>\w+\.fromCharCode\(\w+\)\)\.join\(""\)""")
         // atob: S.append(atob("BASE64"), atob("BASE64"))
         private val ATOB_REGEX = Regex("""\.append\(atob\("([A-Za-z0-9+/=]+)"\),\s*atob\("([A-Za-z0-9+/=]+)"\)\)""")
         // String literal: .append("header","value") ou .set("header","value")
