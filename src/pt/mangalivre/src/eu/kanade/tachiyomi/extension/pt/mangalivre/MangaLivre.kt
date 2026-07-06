@@ -307,8 +307,30 @@ class MangaLivre :
         return current
     }
 
+    // Decoda array de charcode: [120,45,116,...].map(X=>String.fromCharCode(X)).join("")
+    private fun decodeCharCodeArray(numbers: String): String = runCatching {
+        numbers.split(",").map { it.trim().toInt().toChar() }.joinToString("")
+    }.getOrDefault("")
+
+    // Extrai todos os charcode arrays do JS e decodifica
+    private fun extractCharCodeStrings(js: String): List<String> =
+        CHARCODE_REGEX.findAll(js)
+            .map { decodeCharCodeArray(it.groupValues[1]) }
+            .filter(String::isNotBlank)
+            .toList()
+
     private fun extractClientHeader(js: String): Pair<String, String>? {
-        // Formato atual (ofuscado): S.append(atob("B64_NAME"), atob("B64_VALUE"))
+        // Formato mais recente: charcode arrays — [97,112,...].map(G=>String.fromCharCode(G)).join("")
+        // Padrao: [append], [header-name], [header-value]
+        val charcodeStrings = extractCharCodeStrings(js)
+        val appendIdx = charcodeStrings.indexOfFirst { it == "append" }
+        if (appendIdx >= 0 && appendIdx + 2 < charcodeStrings.size) {
+            val name  = charcodeStrings[appendIdx + 1]
+            val value = charcodeStrings[appendIdx + 2]
+            if (name.isNotBlank() && value.isNotBlank()) return name to value
+        }
+
+        // Formato atob: S.append(atob("B64_NAME"), atob("B64_VALUE"))
         // decodeAtob suporta multiplos niveis: atob(atob("...")) etc.
         ATOB_REGEX.find(js)?.let { m ->
             runCatching {
@@ -329,14 +351,16 @@ class MangaLivre :
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val FALLBACK_HEADER = "app-sec-token"
-        private const val DEFAULT_CLIENT = "z11-web-y"
+        private const val FALLBACK_HEADER = "x-tly-nexus"
+        private const val DEFAULT_CLIENT = "c77-block-q"
         private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutos
         private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
         // IPs fixos do Cloudflare para toonlivre.net — usados como fallback de DNS
         private val CF_IPS = listOf("104.21.35.220", "172.67.180.59")
         private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-        // Captura: S.append(atob("BASE64"), atob("BASE64"))
+        // Formato mais recente: charcode arrays [97,112,...].map(G=>String.fromCharCode(G)).join("")
+        private val CHARCODE_REGEX = Regex("""\[(\d+(?:,\s*\d+)+)\]\.map\(\w+=>[^)]*fromCharCode[^)]*\)\.join\(""\)""")
+        // Formato atob: S.append(atob("BASE64"), atob("BASE64"))
         private val ATOB_REGEX = Regex("""\.append\(atob\("([A-Za-z0-9+/=]+)"\),\s*atob\("([A-Za-z0-9+/=]+)"\)\)""")
         // Formato intermediario: S.append("x-tly-token","v99-web-z")
         private val DYNAMIC_REGEX = Regex("\\.append\\(\"([\\w-]+)\",\"([^\"]+)\"\\)")
