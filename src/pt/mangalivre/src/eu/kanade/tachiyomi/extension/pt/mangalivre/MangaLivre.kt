@@ -45,9 +45,18 @@ class MangaLivre :
         .rateLimit(2, 1.seconds) { it.host == baseUrlHost }
         .build()
 
+    // scrapeClient: followRedirects(false) so we can detect redirects to a different host
     private val scrapeClient: OkHttpClient by lazy {
         network.client.newBuilder()
             .followRedirects(false)
+            .build()
+    }
+
+    // bundleClient: follows redirects — used as fallback in fetchBundle so that on Brazilian
+    // carrier networks where www.mangalivre.net resolves, we can still fetch the JS bundle
+    private val bundleClient: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .followRedirects(true)
             .build()
     }
 
@@ -208,36 +217,36 @@ class MangaLivre :
      * O WebView (TokenExtractor) fica como último recurso.
      */
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        if (request.url.host != baseUrlHost) {
-            return chain.proceed(request)
+        val originalRequest = chain.request()
+        if (originalRequest.url.host != baseUrlHost) {
+            return chain.proceed(originalRequest)
         }
 
         val token = currentToken()
-        val response = chain.proceed(request.withClientHeader(token))
-        if (!response.requiresTokenRetry()) {
+        val response = chain.proceed(originalRequest.withClientHeader(token))
+        if (!response.requiresTokenRetry(originalRequest)) {
             return response
         }
 
         response.close()
         for (candidate in scrapeStaticCandidates()) {
             if (candidate == token) continue
-            val retry = chain.proceed(request.withClientHeader(candidate))
-            if (!retry.requiresTokenRetry()) {
+            val retry = chain.proceed(originalRequest.withClientHeader(candidate))
+            if (!retry.requiresTokenRetry(originalRequest)) {
                 cachedToken = candidate
                 return retry
             }
             retry.close()
         }
         extractTokenViaWebView()?.let { webViewToken ->
-            val retry = chain.proceed(request.withClientHeader(webViewToken))
-            if (!retry.requiresTokenRetry()) {
+            val retry = chain.proceed(originalRequest.withClientHeader(webViewToken))
+            if (!retry.requiresTokenRetry(originalRequest)) {
                 cachedToken = webViewToken
                 return retry
             }
             retry.close()
         }
-        return chain.proceed(request.withClientHeader(token))
+        return chain.proceed(originalRequest.withClientHeader(token))
     }
 
     private fun Request.withClientHeader(token: ClientToken): Request =
@@ -272,13 +281,35 @@ class MangaLivre :
             .set("Accept", "*/*")
             .set("Sec-Fetch-Dest", "script")
             .build()
-        val html = scrapeClient.newCall(GET("$baseUrl/", documentHeaders)).execute()
+
+        // First try without redirect: works when toonlivre.net serves directly (some IPs/paths)
+        var html = scrapeClient.newCall(GET("$baseUrl/", documentHeaders)).execute()
             .use { if (it.isSuccessful) it.body.string() else "" }
+
+        // Fallback: follow redirects — on Brazilian carrier networks www.mangalivre.net resolves
+        // and following the redirect gives us the real SPA HTML with asset paths
+        var assetBaseUrl = baseUrl
+        if (html.isEmpty()) {
+            bundleClient.newCall(GET("$baseUrl/", documentHeaders)).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    html = resp.body.string()
+                    // Remember where we actually landed so we fetch assets from the right host
+                    assetBaseUrl = resp.request.url.run { "$scheme://$host" }
+                }
+            }
+        }
+
         val assets = ASSET_REGEX.findAll(html).map { it.value }.distinct().toList()
         return buildString {
             assets.take(MAX_ASSETS).forEach { path ->
-                scrapeClient.newCall(GET("$baseUrl$path", scriptHeaders)).execute()
-                    .use { if (it.isSuccessful) append(it.body.string()) }
+                // Try direct first (no redirect), then follow-redirect fallback
+                var js = scrapeClient.newCall(GET("$baseUrl$path", scriptHeaders)).execute()
+                    .use { if (it.isSuccessful) it.body.string() else "" }
+                if (js.isEmpty() && assetBaseUrl != baseUrl) {
+                    js = bundleClient.newCall(GET("$assetBaseUrl$path", scriptHeaders)).execute()
+                        .use { if (it.isSuccessful) it.body.string() else "" }
+                }
+                if (js.isNotEmpty()) append(js)
             }
         }
     }
@@ -350,8 +381,30 @@ class MangaLivre :
         false
     }
 
-    private fun Response.requiresTokenRetry(): Boolean = (code == 403 && isOfficialAppError()) ||
-        (isRedirect && request.url.resolve(header("Location").orEmpty())?.host != baseUrlHost)
+    private fun Response.isHtmlResponse(): Boolean = try {
+        header("Content-Type")?.contains("text/html", ignoreCase = true) == true ||
+            peekBody(16).string().trimStart().startsWith("<")
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Returns true when we should discard the current token and try a new one.
+     *
+     * We handle three distinct failure modes:
+     *  1. 403 "aplicativo oficial" — server received the request but rejected the token.
+     *  2. 3xx redirect to a different host (scrapeClient with followRedirects=false) — the
+     *     Cloudflare Worker is redirecting the request away instead of proxying it.
+     *  3. client followed a redirect and we ended up on a different host serving HTML —
+     *     the redirect dropped the API path (e.g. sent us to www.mangalivre.net/ root), which
+     *     means the Cloudflare Worker didn't recognise the token and sent us to the SPA homepage.
+     */
+    private fun Response.requiresTokenRetry(originalRequest: Request): Boolean {
+        val originalHost = originalRequest.url.host
+        return (code == 403 && isOfficialAppError()) ||
+            (isRedirect && request.url.resolve(header("Location").orEmpty())?.host != originalHost) ||
+            (request.url.host != originalHost && isHtmlResponse())
+    }
 
     private data class ClientToken(val header: String, val value: String)
 
