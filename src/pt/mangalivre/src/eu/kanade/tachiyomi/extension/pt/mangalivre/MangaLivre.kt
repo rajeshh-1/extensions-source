@@ -205,16 +205,14 @@ class MangaLivre :
         return parseAs<T>()
     }
 
-    @Volatile
-    private var cachedToken: ClientToken? = null
+    @Volatile private var cachedAuthToken: ClientToken? = null
+    @Volatile private var cachedDecoyToken: ClientToken? = null
 
     /**
-     * O gate de "aplicativo oficial" (endpoints de leitura) exige um header de cliente que o
-     * front-end injeta no bundle, rotacionado e reofuscado todo dia (literal -> atob -> char codes
-     * `[..].map(String.fromCharCode)`). Em vez de perseguir cada encoding, decodificamos os
-     * strings do bundle (char codes + base64), montamos pares "nome/valor" com forma de header e
-     * deixamos o 403 "aplicativo oficial" ser o oráculo: testamos os candidatos até um dar 200.
-     * O WebView (TokenExtractor) fica como último recurso.
+     * The site injects different tokens per endpoint type:
+     *   /chapters  → AUTH_TOKEN  (required to read chapter pages)
+     *   everything else → DECOY_TOKEN  (browse/search/manga-detail endpoints)
+     * Both are encoded in the JS bundle as char-code arrays: $([97,117,...]).
      */
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -222,7 +220,8 @@ class MangaLivre :
             return chain.proceed(originalRequest)
         }
 
-        val token = currentToken()
+        val isChapter = originalRequest.url.encodedPath.contains("/chapters")
+        val token = selectToken(isChapter)
         val response = chain.proceed(originalRequest.withClientHeader(token))
         if (!response.requiresTokenRetry(originalRequest)) {
             return response
@@ -233,7 +232,7 @@ class MangaLivre :
             if (candidate == token) continue
             val retry = chain.proceed(originalRequest.withClientHeader(candidate))
             if (!retry.requiresTokenRetry(originalRequest)) {
-                cachedToken = candidate
+                if (isChapter) cachedAuthToken = candidate else cachedDecoyToken = candidate
                 return retry
             }
             retry.close()
@@ -241,7 +240,7 @@ class MangaLivre :
         extractTokenViaWebView()?.let { webViewToken ->
             val retry = chain.proceed(originalRequest.withClientHeader(webViewToken))
             if (!retry.requiresTokenRetry(originalRequest)) {
-                cachedToken = webViewToken
+                if (isChapter) cachedAuthToken = webViewToken
                 return retry
             }
             retry.close()
@@ -249,16 +248,15 @@ class MangaLivre :
         return chain.proceed(originalRequest.withClientHeader(token))
     }
 
+    private fun selectToken(isChapter: Boolean): ClientToken =
+        if (isChapter) cachedAuthToken ?: AUTH_TOKEN else cachedDecoyToken ?: DECOY_TOKEN
+
     private fun Request.withClientHeader(token: ClientToken): Request =
         newBuilder().header(token.header, token.value).build()
 
-    private fun currentToken(): ClientToken = cachedToken ?: synchronized(this) {
-        cachedToken ?: (scrapeStaticCandidates().firstOrNull() ?: DEFAULT_TOKEN).also { cachedToken = it }
-    }
-
     private fun scrapeStaticCandidates(): List<ClientToken> = try {
         val js = fetchBundle()
-        val pool = (decodeChunkedAtob(js) + decodeAlphabet(js) + decodeCharCodes(js) + decodeAtob(js) + decodeLiterals(js)).distinct()
+        val pool = (decodeChunkedAtob(js) + decodeAlphabet(js) + decodeCharCodes(js) + decodeAtob(js) + decodeLiterals(js) + decodeHelperCharCodes(js)).distinct()
         val names = pool.filter { NAME_REGEX.matches(it) && it.lowercase() !in STANDARD_HEADERS }.take(MAX_POOL)
         val values = pool.filter { VALUE_REGEX.matches(it) && it.any(Char::isDigit) }.take(MAX_POOL)
         names
@@ -366,6 +364,18 @@ class MangaLivre :
 
     private fun decodeLiterals(js: String): List<String> = LITERAL_REGEX.findAll(js).map { it.groupValues[1] }.toList()
 
+    // Handles $([97,117,...]) helper-function pattern used by toonlivre to encode header values
+    private fun decodeHelperCharCodes(js: String): List<String> = HELPER_CHARCODE_REGEX.findAll(js)
+        .mapNotNull { match ->
+            val codes = match.groupValues[1].split(",").mapNotNull { it.toIntOrNull() }
+            if (codes.isNotEmpty() && codes.all { it in 32..126 }) {
+                codes.map { it.toChar() }.joinToString("")
+            } else {
+                null
+            }
+        }
+        .toList()
+
     private fun score(value: String): Int = (if (value.any { it.isDigit() }) 200 else 0) + (MAX_VALUE_LEN - value.length).coerceAtLeast(0)
 
     private fun extractTokenViaWebView(): ClientToken? = try {
@@ -417,7 +427,9 @@ class MangaLivre :
         private const val MAX_VALUE_LEN = 40
         private const val NON_JSON_MESSAGE =
             "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
-        private val DEFAULT_TOKEN = ClientToken("toonlivre-pass", "auth2028xy")
+        // Current token values extracted from /assets/index-D14EYlfC.js charcode arrays
+        private val AUTH_TOKEN = ClientToken("toonlivre-pass", "auth2028xy")
+        private val DECOY_TOKEN = ClientToken("toonlivre-pass", "decoy99xz")
         private val STANDARD_HEADERS = setOf("x-csrf-token", "x-requested-with", "x-toonlivre-authenticated-user")
         private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
         private val NAME_REGEX = Regex("[a-z]{2,}(?:-[a-z]{2,})+")
@@ -429,5 +441,7 @@ class MangaLivre :
         private val ATOB_REGEX = Regex("atob\\(\"([A-Za-z0-9+/=]{1,80})\"\\)")
         private val CHUNKED_ATOB_REGEX = Regex("atob\\(\\[((?:\"[A-Za-z0-9+/=]+\",?)+)]")
         private val CHUNK_REGEX = Regex("\"([A-Za-z0-9+/=]+)\"")
+        // Matches $([97,117,...]) helper pattern used by toonlivre to obfuscate header strings
+        private val HELPER_CHARCODE_REGEX = Regex("\\w{1,2}\\(\\[(\\d{2,3}(?:,\\d{2,3}){3,30})\\]\\)")
     }
 }
