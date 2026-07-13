@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.pt.mangalivre
 
-import android.util.Base64
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -15,18 +14,20 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import okhttp3.Dns
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okio.ByteString.Companion.decodeBase64
+import java.io.IOException
 import kotlin.time.Duration.Companion.seconds
 
 class MangaLivre :
     HttpSource(),
     ConfigurableSource {
+
     private val baseUrlHost by lazy { baseUrl.toHttpUrl().host }
 
     override val name: String = "Manga Livre"
@@ -45,31 +46,10 @@ class MangaLivre :
         .build()
 
     private val scrapeClient: OkHttpClient by lazy {
-        network.client.newBuilder().build()
-    }
-
-    // Cliente com DNS fixo nos IPs do Cloudflare — bypassa redirecionamento DNS corporativo
-    private val scrapeClientWithIp: OkHttpClient by lazy {
         network.client.newBuilder()
-            .dns { hostname ->
-                when {
-                    hostname == baseUrlHost -> CF_IPS.map { java.net.InetAddress.getByName(it) }
-                    hostname == "mangalivre.net" -> ML_CF_IPS.map { java.net.InetAddress.getByName(it) }
-                    else -> okhttp3.Dns.SYSTEM.lookup(hostname)
-                }
-            }
+            .followRedirects(false)
             .build()
     }
-
-    // Headers de navegação (document mode) para a homepage — evita redirect do Cloudflare
-    private val scrapeHomepageHeaders: Headers = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0")
-        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .add("Accept-Language", "pt-BR,pt;q=0.9")
-        .add("Sec-Fetch-Dest", "document")
-        .add("Sec-Fetch-Mode", "navigate")
-        .add("Sec-Fetch-Site", "none")
-        .build()
 
     private val apiUrl: String = "$baseUrl/api"
 
@@ -135,7 +115,7 @@ class MangaLivre :
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val dto = response.parseAs<WrapperDto>()
+        val dto = response.parseJson<WrapperDto>()
         val mangas = dto.mangas.map { it.toSManga(useAlternativeTitle) }
         return MangasPage(mangas, dto.hasNextPage)
     }
@@ -146,13 +126,13 @@ class MangaLivre :
 
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/manga-by-slug/${manga.url}", headers)
 
-    override fun mangaDetailsParse(response: Response): SManga = response.parseAs<MangaDto>().toSManga(useAlternativeTitle)
+    override fun mangaDetailsParse(response: Response): SManga = response.parseJson<MangaDto>().toSManga(useAlternativeTitle)
 
     // ============================== Chapters =======================================
 
     override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
 
-    override fun chapterListParse(response: Response): List<SChapter> = response.parseAs<MangaDto>().toSChapterList()
+    override fun chapterListParse(response: Response): List<SChapter> = response.parseJson<MangaDto>().toSChapterList()
 
     // ============================== Pages =======================================
 
@@ -161,7 +141,7 @@ class MangaLivre :
         return GET("$apiUrl/mangas/${dto.mangaId}/chapters/${dto.chapterId}", headers)
     }
 
-    override fun pageListParse(response: Response): List<Page> = response.parseAs<PageDto>().toPageList()
+    override fun pageListParse(response: Response): List<Page> = response.parseJson<PageDto>().toPageList()
 
     override fun imageUrlParse(response: Response): String = ""
 
@@ -207,276 +187,194 @@ class MangaLivre :
 
     // ============================== Helper =======================================
 
-    @Volatile private var cachedClientHeader: Pair<String, String>? = null
-    @Volatile private var cacheTimestamp: Long = 0L
+    private inline fun <reified T> Response.parseJson(): T {
+        val peek = peekBody(MAX_PEEK).string().trimStart()
+        if (peek.isEmpty() || peek.startsWith("<")) {
+            close()
+            throw IOException(NON_JSON_MESSAGE)
+        }
+        return parseAs<T>()
+    }
 
+    @Volatile
+    private var cachedToken: ClientToken? = null
+
+    /**
+     * O gate de "aplicativo oficial" (endpoints de leitura) exige um header de cliente que o
+     * front-end injeta no bundle, rotacionado e reofuscado todo dia (literal -> atob -> char codes
+     * `[..].map(String.fromCharCode)`). Em vez de perseguir cada encoding, decodificamos os
+     * strings do bundle (char codes + base64), montamos pares "nome/valor" com forma de header e
+     * deixamos o 403 "aplicativo oficial" ser o oráculo: testamos os candidatos até um dar 200.
+     * O WebView (TokenExtractor) fica como último recurso.
+     */
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        if (request.url.host != baseUrlHost) return chain.proceed(request)
+        if (request.url.host != baseUrlHost) {
+            return chain.proceed(request)
+        }
 
-        val (headerName, headerValue) = currentClientHeader()
-        val response = chain.proceed(
-            request.newBuilder().header(headerName, headerValue).build(),
-        )
-        if (response.code != 403) return response
+        val token = currentToken()
+        val response = chain.proceed(request.withClientHeader(token))
+        if (!response.requiresTokenRetry()) {
+            return response
+        }
 
-        // 403 recebido: invalida cache e tenta com token novo
         response.close()
-        val (newName, newValue) = refreshClientHeader()
-        return chain.proceed(
-            request.newBuilder().header(newName, newValue).build(),
-        )
+        for (candidate in scrapeStaticCandidates()) {
+            if (candidate == token) continue
+            val retry = chain.proceed(request.withClientHeader(candidate))
+            if (!retry.requiresTokenRetry()) {
+                cachedToken = candidate
+                return retry
+            }
+            retry.close()
+        }
+        extractTokenViaWebView()?.let { webViewToken ->
+            val retry = chain.proceed(request.withClientHeader(webViewToken))
+            if (!retry.requiresTokenRetry()) {
+                cachedToken = webViewToken
+                return retry
+            }
+            retry.close()
+        }
+        return chain.proceed(request.withClientHeader(token))
     }
 
-    // Melhoria 3: valida TTL do cache — re-scrapa se token tiver mais de 30 min
-    private fun currentClientHeader(): Pair<String, String> {
-        val cached = cachedClientHeader
-        val now = System.currentTimeMillis()
-        if (cached != null && now - cacheTimestamp < TOKEN_TTL_MS) return cached
-        return synchronized(this) {
-            val c2 = cachedClientHeader
-            if (c2 != null && now - cacheTimestamp < TOKEN_TTL_MS) return c2
-            scrapeClientHeader().also {
-                cachedClientHeader = it
-                cacheTimestamp = System.currentTimeMillis()
+    private fun Request.withClientHeader(token: ClientToken): Request =
+        newBuilder().header(token.header, token.value).build()
+
+    private fun currentToken(): ClientToken = cachedToken ?: synchronized(this) {
+        cachedToken ?: (scrapeStaticCandidates().firstOrNull() ?: DEFAULT_TOKEN).also { cachedToken = it }
+    }
+
+    private fun scrapeStaticCandidates(): List<ClientToken> = try {
+        val js = fetchBundle()
+        val pool = (decodeChunkedAtob(js) + decodeAlphabet(js) + decodeCharCodes(js) + decodeAtob(js) + decodeLiterals(js)).distinct()
+        val names = pool.filter { NAME_REGEX.matches(it) && it.lowercase() !in STANDARD_HEADERS }.take(MAX_POOL)
+        val values = pool.filter { VALUE_REGEX.matches(it) && it.any(Char::isDigit) }.take(MAX_POOL)
+        names
+            .flatMap { name -> values.mapNotNull { value -> if (name != value) ClientToken(name, value) else null } }
+            .sortedByDescending { score(it.value) }
+            .take(MAX_CANDIDATES)
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun fetchBundle(): String {
+        val documentHeaders = headers.newBuilder()
+            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .set("Sec-Fetch-Dest", "document")
+            .set("Sec-Fetch-Mode", "navigate")
+            .set("Sec-Fetch-Site", "none")
+            .set("Upgrade-Insecure-Requests", "1")
+            .build()
+        val scriptHeaders = headers.newBuilder()
+            .set("Accept", "*/*")
+            .set("Sec-Fetch-Dest", "script")
+            .build()
+        val html = scrapeClient.newCall(GET("$baseUrl/", documentHeaders)).execute()
+            .use { if (it.isSuccessful) it.body.string() else "" }
+        val assets = ASSET_REGEX.findAll(html).map { it.value }.distinct().toList()
+        return buildString {
+            assets.take(MAX_ASSETS).forEach { path ->
+                scrapeClient.newCall(GET("$baseUrl$path", scriptHeaders)).execute()
+                    .use { if (it.isSuccessful) append(it.body.string()) }
             }
         }
     }
 
-    private fun refreshClientHeader(): Pair<String, String> = synchronized(this) {
-        scrapeClientHeader().also {
-            cachedClientHeader = it
-            cacheTimestamp = System.currentTimeMillis()
+    private fun decodeChunkedAtob(js: String): List<String> = CHUNKED_ATOB_REGEX.findAll(js)
+        .mapNotNull { match ->
+            CHUNK_REGEX.findAll(match.groupValues[1])
+                .joinToString("") { it.groupValues[1] }
+                .decodeBase64()
+                ?.utf8()
         }
-    }
+        .toList()
 
-    // Melhoria 1: multiplos fallbacks para buscar a homepage
-    private fun fetchHomepage(): String? {
-        // Tentativa nos dois dominios — toonlivre.net pode redirecionar, tenta tambem mangalivre.net
-        val candidateUrls = listOf(
-            "$baseUrl/",
-            "$baseUrl/index.html",
-            "https://mangalivre.net/",
-            "https://mangalivre.net/index.html",
-        )
-        for (url in candidateUrls) {
-            runCatching {
-                scrapeClient.newCall(GET(url, scrapeHomepageHeaders)).execute()
-                    .use { resp ->
-                        if (resp.isSuccessful) {
-                            resp.body?.string()
-                                ?.takeIf { it.contains("/assets/index-") }
-                                ?.let { return it }
-                        }
-                    }
+    private fun decodeCharCodes(js: String): List<String> = CHARCODE_REGEX.findAll(js)
+        .mapNotNull { match ->
+            val op = match.groupValues[2]
+            val k = match.groupValues[3].toIntOrNull() ?: 0
+            val codes = match.groupValues[1].split(",").mapNotNull { it.toIntOrNull() }.map { n ->
+                when (op) {
+                    "-" -> n - k
+                    "+" -> n + k
+                    "*" -> n * k
+                    "^" -> n xor k
+                    else -> n
+                }
+            }
+            if (codes.isNotEmpty() && codes.all { it in 32..126 }) {
+                codes.map { it.toChar() }.joinToString("")
+            } else {
+                null
             }
         }
+        .toList()
 
-        // Tentativa com DNS fixo nos IPs do Cloudflare (bypassa redirect DNS corporativo)
-        for (url in candidateUrls) {
-            runCatching {
-                scrapeClientWithIp.newCall(GET(url, scrapeHomepageHeaders)).execute()
-                    .use { resp ->
-                        if (resp.isSuccessful) {
-                            resp.body?.string()
-                                ?.takeIf { it.contains("/assets/index-") }
-                                ?.let { return it }
-                        }
-                    }
+    private fun decodeAtob(js: String): List<String> = ATOB_REGEX.findAll(js)
+        .mapNotNull { it.groupValues[1].decodeBase64()?.utf8() }
+        .toList()
+
+    // Mecanismo do site: [indices].map(i => alfabeto[i]).join(""), com o alfabeto num literal.
+    private fun decodeAlphabet(js: String): List<String> {
+        val alphabets = ALPHABET_REGEX.findAll(js).map { it.groupValues[1] }.filter { '-' in it }.distinct().toList()
+        if (alphabets.isEmpty()) return emptyList()
+        return INDEX_REGEX.findAll(js).flatMap { match ->
+            val indices = match.groupValues[1].split(",").mapNotNull { it.toIntOrNull() }
+            alphabets.mapNotNull { alpha ->
+                if (indices.isNotEmpty() && indices.all { it < alpha.length }) {
+                    indices.map { alpha[it] }.joinToString("")
+                } else {
+                    null
+                }
             }
-        }
-        return null
-    }
-
-    private fun scrapeClientHeader(): Pair<String, String> {
-        return try {
-            val html = fetchHomepage() ?: return DEFAULT_HEADER
-            val assetPath = ASSET_REGEX.find(html)?.value ?: return DEFAULT_HEADER
-            // Determina o dominio de origem do asset baseado na URL da homepage encontrada
-            // Sempre usa baseUrl — o redirect para www.mangalivre.net é seguido automaticamente
-            val js = scrapeClient.newCall(GET("$baseUrl$assetPath", headers)).execute()
-                .use { if (it.isSuccessful) it.body?.string() else null }
-                ?: return DEFAULT_HEADER
-            val candidate = extractClientHeader(js) ?: return DEFAULT_HEADER
-            // Valida o token antes de cachealo — detecta token errado imediatamente
-            validateHeader(candidate)
-        } catch (_: Exception) {
-            DEFAULT_HEADER
-        }
-    }
-
-    // Melhoria 2: decodifica multiplos niveis de base64 (atob(atob("...")))
-    private fun decodeAtob(encoded: String, maxDepth: Int = 5): String {
-        var current = encoded
-        repeat(maxDepth) {
-            val decoded = runCatching {
-                Base64.decode(current.trim(), Base64.DEFAULT).toString(Charsets.UTF_8)
-            }.getOrElse { return current }
-            // Para quando nao mudou ou contem bytes nao-ASCII (nao é base64 valido)
-            if (decoded == current || decoded.any { it.code > 126 || it.code < 32 }) return current
-            current = decoded
-        }
-        return current
-    }
-
-    // ============================== Decoders ======================================
-
-    // Charcode: [120,45,...].map(X=>String.fromCharCode(X)).join("")
-    private fun decodeCharCodeArray(numbers: String): String = runCatching {
-        numbers.split(",").map { it.trim().toInt().toChar() }.joinToString("")
-    }.getOrDefault("")
-
-    private fun extractCharCodeStrings(js: String): List<String> =
-        CHARCODE_REGEX.findAll(js)
-            .map { decodeCharCodeArray(it.groupValues[1]) }
-            .filter(String::isNotBlank)
-            .toList()
-
-    // Hex: "\x78\x2d\x74\x6c\x79" -> "x-tly"
-    private fun decodeHexEscapes(s: String): String =
-        HEX_ESCAPE_REGEX.replace(s) { it.groupValues[1].toInt(16).toChar().toString() }
-
-    // Unicode: "x-..." -> "x-tly"
-    private fun decodeUnicodeEscapes(s: String): String =
-        UNICODE_ESCAPE_REGEX.replace(s) { it.groupValues[1].toInt(16).toChar().toString() }
-
-    // XOR: [25^121, 30^91, ...] -> chars
-    private fun decodeXorArray(js: String): List<String> =
-        XOR_ARRAY_REGEX.findAll(js).mapNotNull { m ->
-            runCatching {
-                m.groupValues[1].split(",").map { pair ->
-                    val (a, b) = pair.trim().split("^").map { it.trim().toInt() }
-                    (a xor b).toChar()
-                }.joinToString("")
-            }.getOrNull()
-        }.filter(String::isNotBlank).toList()
-
-    // Reversed string: "suxen-ylt-x".split("").reverse().join("") -> "x-tly-nexus"
-    private fun extractReversedStrings(js: String): List<String> =
-        REVERSED_STR_REGEX.findAll(js).map { m ->
-            decodeHexEscapes(decodeUnicodeEscapes(m.groupValues[1])).reversed()
-        }.filter(String::isNotBlank).toList()
-
-    // String concat: "x-tly" + "-" + "nexus" -> "x-tly-nexus"
-    private fun extractConcatStrings(js: String): List<String> =
-        CONCAT_STR_REGEX.findAll(js).mapNotNull { m ->
-            val full = decodeHexEscapes(decodeUnicodeEscapes(m.value))
-            STR_PART_REGEX.findAll(full).map { it.groupValues[1] }.joinToString("").takeIf(String::isNotBlank)
         }.toList()
-
-    // Extrai todas as strings candidatas do JS usando todos os decoders
-    private fun extractAllCandidateStrings(js: String): List<String> = buildList {
-        // Contexto relevante: regiao ao redor do x-csrf-token (onde fica o auth interceptor)
-        val ctx = run {
-            val idx = js.indexOf("x-csrf-token").takeIf { it >= 0 } ?: return@run js
-            js.substring(maxOf(0, idx - 2000), minOf(js.length, idx + 2000))
-        }
-        // Charcode arrays
-        addAll(extractCharCodeStrings(ctx))
-        // XOR arrays
-        addAll(decodeXorArray(ctx))
-        // Reversed strings
-        addAll(extractReversedStrings(ctx))
-        // Concat strings
-        addAll(extractConcatStrings(ctx))
-        // Hex/unicode encoded literals no contexto
-        PLAIN_STR_REGEX.findAll(ctx).forEach { m ->
-            val decoded = decodeHexEscapes(decodeUnicodeEscapes(m.groupValues[1]))
-            if (decoded.isNotBlank()) add(decoded)
-        }
-    }.distinct()
-
-    private fun extractClientHeader(js: String): Pair<String, String>? {
-        // Estrategia 1: charcode arrays (formato atual)
-        // Padrao: [append], [header-name], [header-value] — consecutivos
-        val charcodeStrings = extractCharCodeStrings(js)
-        val appendIdx = charcodeStrings.indexOfFirst { it == "append" }
-        if (appendIdx >= 0 && appendIdx + 2 < charcodeStrings.size) {
-            val name  = charcodeStrings[appendIdx + 1]
-            val value = charcodeStrings[appendIdx + 2]
-            if (name.isNotBlank() && value.isNotBlank()) return name to value
-        }
-
-        // Estrategia 2: atob (base64, incluindo multinivel)
-        ATOB_REGEX.find(js)?.let { m ->
-            runCatching {
-                val name  = decodeAtob(m.groupValues[1])
-                val value = decodeAtob(m.groupValues[2])
-                if (name.isNotBlank() && value.isNotBlank()) return name to value
-            }
-        }
-
-        // Estrategia 3: strings literais diretas (.append ou .set)
-        DYNAMIC_REGEX.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
-        DYNAMIC_REGEX_SET.find(js)?.let { return it.groupValues[1] to it.groupValues[2] }
-
-        // Estrategia 4: busca ampla — extrai todos os candidatos via todos os decoders
-        // e tenta encontrar par (header-name, header-value) valido
-        val candidates = extractAllCandidateStrings(js)
-        val headerNameIdx = candidates.indexOfFirst { HEADER_NAME_PATTERN.matches(it) }
-        if (headerNameIdx >= 0) {
-            // Pega o proximo candidato que parece um token
-            val value = candidates.drop(headerNameIdx + 1).firstOrNull { HEADER_VALUE_PATTERN.matches(it) }
-            if (value != null) return candidates[headerNameIdx] to value
-        }
-
-        // Ultimo recurso: shape regex historico
-        val value = SHAPE_REGEX.findAll(js).map { it.groupValues[1] }.firstOrNull() ?: return null
-        return FALLBACK_HEADER to value
     }
 
-    // Valida o token extraido fazendo uma requisicao teste leve
-    private fun validateHeader(candidate: Pair<String, String>): Pair<String, String> {
-        return try {
-            val (name, value) = candidate
-            val testHeaders = headers.newBuilder().set(name, value).build()
-            val resp = scrapeClient.newCall(GET("$apiUrl/mangas/search?page=1&limit=1", testHeaders)).execute()
-            val code = resp.code
-            resp.close()
-            if (code != 403) candidate else DEFAULT_HEADER
-        } catch (_: Exception) {
-            candidate
-        }
+    private fun decodeLiterals(js: String): List<String> = LITERAL_REGEX.findAll(js).map { it.groupValues[1] }.toList()
+
+    private fun score(value: String): Int = (if (value.any { it.isDigit() }) 200 else 0) + (MAX_VALUE_LEN - value.length).coerceAtLeast(0)
+
+    private fun extractTokenViaWebView(): ClientToken? = try {
+        TokenExtractor.extract(baseUrl, headers["User-Agent"])
+            ?.let { ClientToken(it.header, it.value) }
+    } catch (_: Exception) {
+        null
     }
+
+    private fun Response.isOfficialAppError(): Boolean = try {
+        peekBody(MAX_PEEK).string().contains("aplicativo oficial", ignoreCase = true)
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun Response.requiresTokenRetry(): Boolean = (code == 403 && isOfficialAppError()) ||
+        (isRedirect && request.url.resolve(header("Location").orEmpty())?.host != baseUrlHost)
+
+    private data class ClientToken(val header: String, val value: String)
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val FALLBACK_HEADER = "x-tly-nexus"
-        private const val DEFAULT_CLIENT = "c77-block-q"
-        private const val TOKEN_TTL_MS = 30 * 60 * 1000L // 30 minutos
-        private val DEFAULT_HEADER = FALLBACK_HEADER to DEFAULT_CLIENT
-        // IPs fixos do Cloudflare para toonlivre.net — usados como fallback de DNS
-        private val CF_IPS = listOf("104.21.35.220", "172.67.180.59")
-        // IPs do Cloudflare para mangalivre.net (dominio alternativo de fallback para scraping)
-        private val ML_CF_IPS = listOf("104.21.1.168", "172.67.129.165")
-        private val ASSET_REGEX = Regex("/assets/index-[\\w-]+\\.js")
-
-        // --- Decoders para cada tecnica de ofuscacao ---
-
-        // Charcode: [120,45,...].map(G=>String.fromCharCode(G)).join("")
-        private val CHARCODE_REGEX = Regex("""\[(\d+(?:,\d+)+)\]\.map\(\w+=>\w+\.fromCharCode\(\w+\)\)\.join\(""\)""")
-        // atob: S.append(atob("BASE64"), atob("BASE64"))
-        private val ATOB_REGEX = Regex("""\.append\(atob\("([A-Za-z0-9+/=]+)"\),\s*atob\("([A-Za-z0-9+/=]+)"\)\)""")
-        // String literal: .append("header","value") ou .set("header","value")
-        private val DYNAMIC_REGEX = Regex("\\.append\\(\"([\\w-]+)\",\"([^\"]+)\"\\)")
-        private val DYNAMIC_REGEX_SET = Regex("\\.set\\(\"([\\w-]+)\",\"([^\"]+)\"\\)")
-        // Hex escapes: "\x78\x2d\x74\x6c\x79"
-        private val HEX_ESCAPE_REGEX = Regex("\\\\x([0-9a-fA-F]{2})")
-        // Unicode escapes: "x-..."
-        private val UNICODE_ESCAPE_REGEX = Regex("\\\\u([0-9a-fA-F]{4})")
-        // XOR: [25^121, 30^91, ...]
-        private val XOR_ARRAY_REGEX = Regex("""\[(\d+\^\d+(?:,\s*\d+\^\d+)+)\]""")
-        // String reversed: "esrever".split("").reverse().join("")
-        private val REVERSED_STR_REGEX = Regex(""""([^"]{3,30})"\.split\(""\)\.reverse\(\)\.join\(""\)""")
-        // String concat: "x-tly" + "-" + "nexus"
-        private val CONCAT_STR_REGEX = Regex(""""[^"]{2,15}"(?:\s*\+\s*"[^"]{1,15}"){1,5}""")
-        private val STR_PART_REGEX = Regex(""""([^"]+)"""")
-        // Strings literais no contexto (hex/unicode encoded)
-        private val PLAIN_STR_REGEX = Regex(""""((?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|[^"\\]){3,30})"""")
-        // Padrao de header name e header value validos
-        private val HEADER_NAME_PATTERN = Regex("[a-zA-Z][\\w-]{2,25}")
-        private val HEADER_VALUE_PATTERN = Regex("[a-zA-Z0-9][a-zA-Z0-9_-]{2,30}")
-        // Shape historico como ultimo recurso
-        private val SHAPE_REGEX = Regex("\"([a-z][0-9]+-web-[a-z0-9-]+)\"")
+        private const val MAX_PEEK = 1024L
+        private const val MAX_ASSETS = 8
+        private const val MAX_POOL = 12
+        private const val MAX_CANDIDATES = 16
+        private const val MAX_VALUE_LEN = 40
+        private const val NON_JSON_MESSAGE =
+            "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
+        private val DEFAULT_TOKEN = ClientToken("x-tly-omega", "y00-decoy-w")
+        private val STANDARD_HEADERS = setOf("x-csrf-token", "x-requested-with", "x-toonlivre-authenticated-user")
+        private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
+        private val NAME_REGEX = Regex("(x|app)-[a-z]{2,}(-[a-z]{2,})*")
+        private val VALUE_REGEX = Regex("[a-z0-9]{2,5}-[a-z0-9]{2,14}(-[a-z])?")
+        private val ALPHABET_REGEX = Regex("\"([a-z0-9][a-z0-9-]{24,45})\"")
+        private val INDEX_REGEX = Regex("\\[(\\d{1,2}(?:,\\d{1,2}){3,60})\\]\\.map\\(\\w+=>[\\w\$]{1,3}\\[\\w+\\]\\)")
+        private val LITERAL_REGEX = Regex("\"([a-z0-9][a-z0-9-]{3,40})\"")
+        private val CHARCODE_REGEX = Regex("\\[([\\d,]{5,240})\\][^\\[]{0,60}?fromCharCode\\([a-z]+(?:([-+*^])(\\d{1,4}))?\\)")
+        private val ATOB_REGEX = Regex("atob\\(\"([A-Za-z0-9+/=]{1,80})\"\\)")
+        private val CHUNKED_ATOB_REGEX = Regex("atob\\(\\[((?:\"[A-Za-z0-9+/=]+\",?)+)]")
+        private val CHUNK_REGEX = Regex("\"([A-Za-z0-9+/=]+)\"")
     }
 }
