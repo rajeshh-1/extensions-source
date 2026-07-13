@@ -10,13 +10,9 @@ class MangaLivre :
         "Manga Livre",
         "https://mangalivre.to",
         "pt-BR",
-        SimpleDateFormat("dd 'de' MMMM 'de' yyyy", Locale("pt")),
+        SimpleDateFormat("MMMM dd, yyyy", Locale("pt")),
     ) {
     override val client = super.client.newBuilder()
         .rateLimit(2)
         .build()
-
-    override fun chapterListSelector() = ".listing-chapters-wrap .chapter-box"
-
-    override fun chapterDateSelector() = ".chapter-date"
 }
