@@ -253,7 +253,28 @@ class MangaLivre :
             }
             retry.close()
         }
-        return chain.proceed(originalRequest.withClientHeader(token))
+        val finalResponse = chain.proceed(originalRequest.withClientHeader(token))
+        // DIAGNOSTIC: when a chapter request still 403s after every retry, surface the response
+        // fingerprint in the error message so we can tell an app-token rejection ("aplicativo
+        // oficial" JSON) from a Cloudflare block (Server: cloudflare + cf-mitigated header).
+        if (isChapter && finalResponse.code == 403) {
+            val diag = buildString {
+                append("MangaLivre 403 | server=").append(finalResponse.header("Server") ?: "?")
+                append(" | cf-mitigated=").append(finalResponse.header("cf-mitigated") ?: "-")
+                append(" | ct=").append(finalResponse.header("Content-Type") ?: "?")
+                append(" | ua=").append((deviceUserAgent() ?: "?").take(30))
+                append(" | body=").append(
+                    try {
+                        finalResponse.peekBody(220).string().replace(Regex("\\s+"), " ").take(150)
+                    } catch (_: Exception) {
+                        "?"
+                    },
+                )
+            }
+            finalResponse.close()
+            throw IOException(diag)
+        }
+        return finalResponse
     }
 
     private fun selectToken(isChapter: Boolean): ClientToken =
