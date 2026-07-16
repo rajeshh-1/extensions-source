@@ -32,6 +32,31 @@ object TokenExtractor {
 
     data class Token(val header: String, val value: String)
 
+    /**
+     * Reads the device WebView's User-Agent string. Cloudflare binds the cf_clearance cookie to
+     * the exact UA that solved the challenge, so the extension's HTTP client must send that same
+     * UA — otherwise Cloudflare rejects the request with 403 even though the cookie is present.
+     */
+    fun getUserAgent(): String? {
+        val context = Injekt.get<Application>()
+        val handler = Handler(Looper.getMainLooper())
+        val latch = CountDownLatch(1)
+        var ua: String? = null
+        handler.post {
+            try {
+                val wv = WebView(context)
+                ua = wv.settings.userAgentString
+                wv.destroy()
+            } catch (_: Exception) {
+                // Ignore — caller falls back to the default UA.
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await(5, TimeUnit.SECONDS)
+        return ua
+    }
+
     @Synchronized
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     fun extract(siteUrl: String, userAgent: String? = null): Token? {
