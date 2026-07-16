@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -22,6 +23,12 @@ import okhttp3.Request
 import okhttp3.Response
 import okio.ByteString.Companion.decodeBase64
 import java.io.IOException
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import kotlin.random.Random
 import kotlin.time.Duration.Companion.seconds
 
 class MangaLivre :
@@ -207,6 +214,7 @@ class MangaLivre :
 
     @Volatile private var cachedAuthToken: ClientToken? = null
     @Volatile private var cachedDecoyToken: ClientToken? = null
+    @Volatile private var webViewUserAgent: String? = null
 
     /**
      * The site injects different tokens per endpoint type:
@@ -251,8 +259,24 @@ class MangaLivre :
     private fun selectToken(isChapter: Boolean): ClientToken =
         if (isChapter) cachedAuthToken ?: AUTH_TOKEN else cachedDecoyToken ?: DECOY_TOKEN
 
-    private fun Request.withClientHeader(token: ClientToken): Request =
-        newBuilder().header(token.header, token.value).build()
+    private fun Request.withClientHeader(token: ClientToken): Request {
+        val builder = newBuilder().header(token.header, token.value)
+        // Align the UA with the device WebView so the shared cf_clearance cookie stays valid.
+        deviceUserAgent()?.let { builder.header("User-Agent", it) }
+        return builder.build()
+    }
+
+    /**
+     * The device WebView's User-Agent, fetched once and cached. cf_clearance is bound to this UA,
+     * so every authenticated request must carry it or Cloudflare answers 403 despite a valid token.
+     */
+    private fun deviceUserAgent(): String? = webViewUserAgent ?: synchronized(this) {
+        webViewUserAgent ?: try {
+            TokenExtractor.getUserAgent()?.also { webViewUserAgent = it }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     private fun scrapeStaticCandidates(): List<ClientToken> = try {
         val js = fetchBundle()
@@ -385,12 +409,6 @@ class MangaLivre :
         null
     }
 
-    private fun Response.isOfficialAppError(): Boolean = try {
-        peekBody(MAX_PEEK).string().contains("aplicativo oficial", ignoreCase = true)
-    } catch (_: Exception) {
-        false
-    }
-
     private fun Response.isHtmlResponse(): Boolean = try {
         header("Content-Type")?.contains("text/html", ignoreCase = true) == true ||
             peekBody(16).string().trimStart().startsWith("<")
@@ -411,7 +429,10 @@ class MangaLivre :
      */
     private fun Response.requiresTokenRetry(originalRequest: Request): Boolean {
         val originalHost = originalRequest.url.host
-        return (code == 403 && isOfficialAppError()) ||
+        // Any 403 triggers recovery: either the app rejected the token ("aplicativo oficial") or
+        // Cloudflare rejected the session. Both are healed by the WebView pass, which refreshes
+        // cf_clearance in the shared cookie jar and lets the final retry through with the right UA.
+        return code == 403 ||
             (isRedirect && request.url.resolve(header("Location").orEmpty())?.host != originalHost) ||
             (request.url.host != originalHost && isHtmlResponse())
     }
