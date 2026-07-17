@@ -170,11 +170,23 @@ class MangaLivre :
         val encrypted = response.parseAs<Map<String, String>>()[dataKey]
             ?: throw IOException("Resposta criptografada sem o campo indicado por $DATA_KEY_HEADER.")
         val decrypted = try {
-            Rabbit.decrypt(encrypted, dataKey)
+            Rabbit.decrypt(encrypted, currentRabbitPassphrase())
         } catch (error: Exception) {
             throw IOException("Não foi possível descriptografar as páginas do ToonLivre.", error)
         }
         return decrypted.parseAs<PageDto>().toPageList()
+    }
+
+    private fun currentRabbitPassphrase(): String {
+        val utcDate = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+        val input = "$utcDate$RABBIT_SITE_SALT$RABBIT_BUILD_SALT"
+        val suffix = MessageDigest.getInstance("MD5")
+            .digest(input.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            .take(8)
+        return "$RABBIT_PASSPHRASE_PREFIX$suffix"
     }
 
     override fun imageUrlParse(response: Response): String = ""
@@ -500,6 +512,9 @@ class MangaLivre :
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
         private const val MAX_PEEK = 1024L
         private const val DATA_KEY_HEADER = "x-toon-datakey"
+        private const val RABBIT_PASSPHRASE_PREFIX = "Dealer-Critter-Catnip4"
+        private const val RABBIT_SITE_SALT = "toonlivre.tv::v8"
+        private const val RABBIT_BUILD_SALT = "t17_4v19_b2"
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
         private const val MAX_CANDIDATES = 16
