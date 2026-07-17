@@ -59,12 +59,36 @@ object TokenExtractor {
 
     @Synchronized
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    fun extract(siteUrl: String, userAgent: String? = null): Token? {
+    fun extract(siteUrl: String, userAgent: String? = null): List<Token> {
         val context = Injekt.get<Application>()
         val handler = Handler(Looper.getMainLooper())
         val latch = CountDownLatch(1)
-        var result: Token? = null
+        val result = mutableListOf<Token>()
         var webView: WebView? = null
+
+        fun capture(header: String, value: String) {
+            val normalized = header.lowercase()
+            if (
+                normalized in STANDARD_HEADER_NAMES ||
+                header.isBlank() ||
+                value.isBlank() ||
+                value.length >= 256
+            ) {
+                return
+            }
+            synchronized(result) {
+                val token = Token(header, value)
+                if (token !in result) result.add(token)
+                val hasAuth = result.any {
+                    it.header.equals("toonlivre-pass", ignoreCase = true) &&
+                        !it.value.contains("decoy", ignoreCase = true)
+                }
+                val hasVerify = result.any {
+                    it.header.equals("x-toon-verify", ignoreCase = true)
+                }
+                if (hasAuth && hasVerify && latch.count > 0L) latch.countDown()
+            }
+        }
 
         handler.post {
             val wv = WebView(context)
@@ -90,10 +114,7 @@ object TokenExtractor {
             val bridge = object : Any() {
                 @JavascriptInterface
                 fun onToken(header: String, value: String) {
-                    if (latch.count > 0L) {
-                        result = Token(header, value)
-                        latch.countDown()
-                    }
+                    capture(header, value)
                 }
             }
             wv.addJavascriptInterface(bridge, "TokenBridge")
@@ -107,16 +128,9 @@ object TokenExtractor {
                     view: WebView,
                     request: WebResourceRequest,
                 ): WebResourceResponse? {
-                    if (latch.count > 0L) {
-                        val reqHeaders = request.requestHeaders ?: emptyMap()
-                        for ((key, value) in reqHeaders) {
-                            val lk = key.lowercase()
-                            if (lk !in STANDARD_HEADER_NAMES && value.length < 60 && value.isNotBlank()) {
-                                result = Token(key, value)
-                                latch.countDown()
-                                break
-                            }
-                        }
+                    val reqHeaders = request.requestHeaders ?: emptyMap()
+                    for ((key, value) in reqHeaders) {
+                        capture(key, value)
                     }
                     return null // let WebView proceed normally
                 }
@@ -172,6 +186,6 @@ object TokenExtractor {
             webView?.destroy()
         }
 
-        return result
+        return synchronized(result) { result.toList() }
     }
 }
