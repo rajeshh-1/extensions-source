@@ -153,8 +153,12 @@ class MangaLivre :
     // ============================== Pages =======================================
 
     override fun pageListRequest(chapter: SChapter): Request {
+        val readerPath = chapter.url.substringBeforeLast("#")
         val dto = chapter.url.substringAfterLast("#").parseAs<ChapterReferenceDto>()
         return GET("$apiUrl/mangas/${dto.mangaId}/chapters/${dto.chapterId}", headers)
+            .newBuilder()
+            .tag(ReaderPath::class.java, ReaderPath(readerPath))
+            .build()
     }
 
     override fun pageListParse(response: Response): List<Page> = response.parseJson<PageDto>().toPageList()
@@ -214,6 +218,7 @@ class MangaLivre :
 
     @Volatile private var cachedAuthToken: ClientToken? = null
     @Volatile private var cachedDecoyToken: ClientToken? = null
+    @Volatile private var cachedVerifyToken: ClientToken? = null
     @Volatile private var webViewUserAgent: String? = null
 
     /**
@@ -230,7 +235,7 @@ class MangaLivre :
 
         val isChapter = originalRequest.url.encodedPath.contains("/chapters")
         val token = selectToken(isChapter)
-        val response = chain.proceed(originalRequest.withClientHeader(token))
+        val response = chain.proceed(originalRequest.withClientHeaders(token, cachedVerifyToken))
         if (!response.requiresTokenRetry(originalRequest)) {
             return response
         }
@@ -238,22 +243,31 @@ class MangaLivre :
         response.close()
         for (candidate in scrapeStaticCandidates()) {
             if (candidate == token) continue
-            val retry = chain.proceed(originalRequest.withClientHeader(candidate))
+            val retry = chain.proceed(originalRequest.withClientHeaders(candidate, cachedVerifyToken))
             if (!retry.requiresTokenRetry(originalRequest)) {
                 if (isChapter) cachedAuthToken = candidate else cachedDecoyToken = candidate
                 return retry
             }
             retry.close()
         }
-        extractTokenViaWebView()?.let { webViewToken ->
-            val retry = chain.proceed(originalRequest.withClientHeader(webViewToken))
+        val readerPath = originalRequest.tag(ReaderPath::class.java)
+        extractTokensViaWebView(readerPath)?.let { tokens ->
+            val webViewToken = tokens.firstOrNull {
+                it.header.equals(AUTH_TOKEN.header, ignoreCase = true) &&
+                    !it.value.contains("decoy", ignoreCase = true)
+            } ?: AUTH_TOKEN
+            val verifyToken = tokens.firstOrNull {
+                it.header.equals(VERIFY_HEADER, ignoreCase = true)
+            }
+            val retry = chain.proceed(originalRequest.withClientHeaders(webViewToken, verifyToken))
             if (!retry.requiresTokenRetry(originalRequest)) {
                 if (isChapter) cachedAuthToken = webViewToken
+                cachedVerifyToken = verifyToken
                 return retry
             }
             retry.close()
         }
-        val finalResponse = chain.proceed(originalRequest.withClientHeader(token))
+        val finalResponse = chain.proceed(originalRequest.withClientHeaders(token, cachedVerifyToken))
         // DIAGNOSTIC: when a chapter request still 403s after every retry, surface the response
         // fingerprint in the error message so we can tell an app-token rejection ("aplicativo
         // oficial" JSON) from a Cloudflare block (Server: cloudflare + cf-mitigated header).
@@ -280,8 +294,12 @@ class MangaLivre :
     private fun selectToken(isChapter: Boolean): ClientToken =
         if (isChapter) cachedAuthToken ?: AUTH_TOKEN else cachedDecoyToken ?: DECOY_TOKEN
 
-    private fun Request.withClientHeader(token: ClientToken): Request {
+    private fun Request.withClientHeaders(
+        token: ClientToken,
+        verifyToken: ClientToken?,
+    ): Request {
         val builder = newBuilder().header(token.header, token.value)
+        verifyToken?.let { builder.header(it.header, it.value) }
         // Align the UA with the device WebView so the shared cf_clearance cookie stays valid.
         deviceUserAgent()?.let { builder.header("User-Agent", it) }
         return builder.build()
@@ -423,9 +441,11 @@ class MangaLivre :
 
     private fun score(value: String): Int = (if (value.any { it.isDigit() }) 200 else 0) + (MAX_VALUE_LEN - value.length).coerceAtLeast(0)
 
-    private fun extractTokenViaWebView(): ClientToken? = try {
-        TokenExtractor.extract(baseUrl, headers["User-Agent"])
-            ?.let { ClientToken(it.header, it.value) }
+    private fun extractTokensViaWebView(readerPath: ReaderPath?): List<ClientToken>? = try {
+        val pageUrl = readerPath?.let { "$baseUrl${it.path}" } ?: return null
+        TokenExtractor.extract(pageUrl, deviceUserAgent())
+            .map { ClientToken(it.header, it.value) }
+            .takeIf { it.isNotEmpty() }
     } catch (_: Exception) {
         null
     }
@@ -460,6 +480,8 @@ class MangaLivre :
 
     private data class ClientToken(val header: String, val value: String)
 
+    private data class ReaderPath(val path: String)
+
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
         private const val MAX_PEEK = 1024L
@@ -472,6 +494,7 @@ class MangaLivre :
         // Current token values extracted from /assets/index-D14EYlfC.js charcode arrays
         private val AUTH_TOKEN = ClientToken("toonlivre-pass", "auth2028xy")
         private val DECOY_TOKEN = ClientToken("toonlivre-pass", "decoy99xz")
+        private const val VERIFY_HEADER = "x-toon-verify"
         private val STANDARD_HEADERS = setOf("x-csrf-token", "x-requested-with", "x-toonlivre-authenticated-user")
         private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
         private val NAME_REGEX = Regex("[a-z]{2,}(?:-[a-z]{2,})+")
