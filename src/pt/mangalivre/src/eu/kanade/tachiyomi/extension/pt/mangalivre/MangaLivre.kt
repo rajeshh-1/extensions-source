@@ -14,13 +14,16 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonString
 import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.ByteString.Companion.decodeBase64
 import java.io.IOException
 import java.security.MessageDigest
@@ -162,19 +165,23 @@ class MangaLivre :
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val dataKey = response.header(DATA_KEY_HEADER)
-        if (dataKey.isNullOrBlank()) {
-            return response.parseJson<PageDto>().toPageList()
-        }
+        return try {
+            val dataKey = response.header(DATA_KEY_HEADER)
+            if (dataKey.isNullOrBlank()) {
+                return response.parseJson<PageDto>().toPageList()
+            }
 
-        val encrypted = response.parseAs<Map<String, String>>()[dataKey]
-            ?: throw IOException("Resposta criptografada sem o campo indicado por $DATA_KEY_HEADER.")
-        val decrypted = try {
+            val encrypted = response.parseAs<Map<String, String>>()[dataKey]
+                ?: throw IOException("Envelope criptografado inválido.")
             Rabbit.decrypt(encrypted, currentRabbitPassphrase())
-        } catch (error: Exception) {
-            throw IOException("Não foi possível descriptografar as páginas do ToonLivre.", error)
+                .parseAs<PageDto>()
+                .toPageList()
+        } catch (apiError: Exception) {
+            extractPagesViaWebView(response.request.tag(ReaderPath::class.java))
+                .takeIf { it.isNotEmpty() }
+                ?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+                ?: throw IOException("MangaLivre: API alterada e fallback WebView sem páginas.", apiError)
         }
-        return decrypted.parseAs<PageDto>().toPageList()
     }
 
     private fun currentRabbitPassphrase(): String {
@@ -294,6 +301,21 @@ class MangaLivre :
             retry.close()
         }
         val finalResponse = chain.proceed(originalRequest.withClientHeaders(token, cachedVerifyToken))
+        if (isChapter && finalResponse.code == 403) {
+            val fallbackPages = extractPagesViaWebView(readerPath)
+            if (fallbackPages.isNotEmpty()) {
+                val responseBody = PageDto(fallbackPages)
+                    .toJsonString()
+                    .toResponseBody(JSON_MEDIA_TYPE)
+                return finalResponse.newBuilder()
+                    .code(200)
+                    .message("OK (WebView fallback)")
+                    .removeHeader(DATA_KEY_HEADER)
+                    .body(responseBody)
+                    .build()
+                    .also { finalResponse.close() }
+            }
+        }
         // DIAGNOSTIC: when a chapter request still 403s after every retry, surface the response
         // fingerprint in the error message so we can tell an app-token rejection ("aplicativo
         // oficial" JSON) from a Cloudflare block (Server: cloudflare + cf-mitigated header).
@@ -476,6 +498,13 @@ class MangaLivre :
         null
     }
 
+    private fun extractPagesViaWebView(readerPath: ReaderPath?): List<String> = try {
+        val pageUrl = readerPath?.let { "$baseUrl${it.path}" } ?: return emptyList()
+        TokenExtractor.extractPages(pageUrl, deviceUserAgent())
+    } catch (_: Exception) {
+        emptyList()
+    }
+
     private fun Response.isHtmlResponse(): Boolean = try {
         header("Content-Type")?.contains("text/html", ignoreCase = true) == true ||
             peekBody(16).string().trimStart().startsWith("<")
@@ -515,6 +544,7 @@ class MangaLivre :
         private const val RABBIT_PASSPHRASE_PREFIX = "Dealer-Critter-Catnip4"
         private const val RABBIT_SITE_SALT = "toonlivre.tv::v8"
         private const val RABBIT_BUILD_SALT = "t17_4v19_b2"
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
         private const val MAX_CANDIDATES = 16
