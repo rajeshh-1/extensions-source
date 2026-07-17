@@ -32,6 +32,11 @@ object TokenExtractor {
 
     data class Token(val header: String, val value: String)
 
+    private val IMAGE_URL_REGEX = Regex(
+        """https://cdn\.toonlivre\.net/obras/[^"' <>()]+?\.(?:avif|gif|jpe?g|png|webp)(?:\?[^"' <>()]*)?""",
+        RegexOption.IGNORE_CASE,
+    )
+
     /**
      * Reads the device WebView's User-Agent string. Cloudflare binds the cf_clearance cookie to
      * the exact UA that solved the challenge, so the extension's HTTP client must send that same
@@ -187,5 +192,118 @@ object TokenExtractor {
         }
 
         return synchronized(result) { result.toList() }
+    }
+
+    /**
+     * Last-resort reader path. Instead of reproducing the site's private headers, encryption and
+     * JSON schema, let its own WebView application render the chapter and collect the image URLs.
+     * This keeps reading functional when the API contract changes but the public reader still works.
+     */
+    @Synchronized
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    fun extractPages(siteUrl: String, userAgent: String? = null): List<String> {
+        val context = Injekt.get<Application>()
+        val handler = Handler(Looper.getMainLooper())
+        val latch = CountDownLatch(1)
+        val interceptedPages = mutableListOf<String>()
+        var domPages: List<String> = emptyList()
+        var webView: WebView? = null
+
+        fun capture(url: String) {
+            val pageUrl = IMAGE_URL_REGEX.find(url)?.value ?: return
+            synchronized(interceptedPages) {
+                if (pageUrl !in interceptedPages) interceptedPages.add(pageUrl)
+            }
+        }
+
+        handler.post {
+            try {
+                val view = WebView(context)
+                webView = view
+                view.layoutParams = ViewGroup.LayoutParams(WEBVIEW_WIDTH, WEBVIEW_HEIGHT)
+                view.measure(
+                    View.MeasureSpec.makeMeasureSpec(WEBVIEW_WIDTH, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(WEBVIEW_HEIGHT, View.MeasureSpec.EXACTLY),
+                )
+                view.layout(0, 0, WEBVIEW_WIDTH, WEBVIEW_HEIGHT)
+
+                with(view.settings) {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    loadWithOverviewMode = true
+                    useWideViewPort = true
+                    if (!userAgent.isNullOrBlank()) userAgentString = userAgent
+                }
+
+                view.addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun onPages(serialized: String) {
+                            val pages = IMAGE_URL_REGEX.findAll(serialized)
+                                .map { it.value.replace("\\/", "/") }
+                                .distinct()
+                                .toList()
+                            if (pages.isNotEmpty()) {
+                                domPages = pages
+                                latch.countDown()
+                            }
+                        }
+                    },
+                    "PageBridge",
+                )
+
+                view.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView,
+                        request: WebResourceRequest,
+                    ): WebResourceResponse? {
+                        capture(request.url.toString())
+                        return null
+                    }
+
+                    override fun onPageFinished(view: WebView, url: String) {
+                        listOf(2_000L, 5_000L, 10_000L).forEach { delay ->
+                            handler.postDelayed(
+                                {
+                                    if (latch.count == 0L) return@postDelayed
+                                    view.evaluateJavascript(
+                                        """
+                                        (function() {
+                                            const values = [];
+                                            document.querySelectorAll('img, source').forEach(function(el) {
+                                                ['src','data-src','data-lazy-src','srcset'].forEach(function(attr) {
+                                                    const value = el.getAttribute(attr);
+                                                    if (value) values.push(...value.split(',').map(function(v) {
+                                                        return v.trim().split(/\s+/)[0];
+                                                    }));
+                                                });
+                                            });
+                                            PageBridge.onPages(JSON.stringify(values));
+                                        })();
+                                        """.trimIndent(),
+                                        null,
+                                    )
+                                },
+                                delay,
+                            )
+                        }
+                    }
+                }
+                view.loadUrl(siteUrl)
+            } catch (_: Throwable) {
+                latch.countDown()
+            }
+        }
+
+        latch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        handler.post {
+            webView?.stopLoading()
+            webView?.destroy()
+        }
+
+        return domPages.ifEmpty {
+            synchronized(interceptedPages) { interceptedPages.toList() }
+        }
     }
 }
