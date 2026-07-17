@@ -161,7 +161,21 @@ class MangaLivre :
             .build()
     }
 
-    override fun pageListParse(response: Response): List<Page> = response.parseJson<PageDto>().toPageList()
+    override fun pageListParse(response: Response): List<Page> {
+        val dataKey = response.header(DATA_KEY_HEADER)
+        if (dataKey.isNullOrBlank()) {
+            return response.parseJson<PageDto>().toPageList()
+        }
+
+        val encrypted = response.parseAs<Map<String, String>>()[dataKey]
+            ?: throw IOException("Resposta criptografada sem o campo indicado por $DATA_KEY_HEADER.")
+        val decrypted = try {
+            Rabbit.decrypt(encrypted, dataKey)
+        } catch (error: Exception) {
+            throw IOException("Não foi possível descriptografar as páginas do ToonLivre.", error)
+        }
+        return decrypted.parseAs<PageDto>().toPageList()
+    }
 
     override fun imageUrlParse(response: Response): String = ""
 
@@ -485,6 +499,7 @@ class MangaLivre :
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
         private const val MAX_PEEK = 1024L
+        private const val DATA_KEY_HEADER = "x-toon-datakey"
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
         private const val MAX_CANDIDATES = 16
