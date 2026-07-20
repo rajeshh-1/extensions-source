@@ -84,14 +84,15 @@ object TokenExtractor {
             synchronized(result) {
                 val token = Token(header, value)
                 if (token !in result) result.add(token)
-                val hasAuth = result.any {
-                    it.header.equals("toonlivre-pass", ignoreCase = true) &&
+                val hasSignature = result.any {
+                    it.header.contains("toon", ignoreCase = true) &&
+                        !it.header.equals("x-toon-verify", ignoreCase = true) &&
                         !it.value.contains("decoy", ignoreCase = true)
                 }
                 val hasVerify = result.any {
                     it.header.equals("x-toon-verify", ignoreCase = true)
                 }
-                if (hasAuth && hasVerify && latch.count > 0L) latch.countDown()
+                if (hasSignature && hasVerify && latch.count > 0L) latch.countDown()
             }
         }
 
