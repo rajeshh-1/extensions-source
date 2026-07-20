@@ -286,7 +286,8 @@ class MangaLivre :
         val readerPath = originalRequest.tag(ReaderPath::class.java)
         extractTokensViaWebView(readerPath)?.let { tokens ->
             val webViewToken = tokens.firstOrNull {
-                it.header.equals(AUTH_TOKEN.header, ignoreCase = true) &&
+                it.header.contains("toon", ignoreCase = true) &&
+                    !it.header.equals(VERIFY_HEADER, ignoreCase = true) &&
                     !it.value.contains("decoy", ignoreCase = true)
             } ?: AUTH_TOKEN
             val verifyToken = tokens.firstOrNull {
@@ -551,9 +552,9 @@ class MangaLivre :
         private const val MAX_VALUE_LEN = 40
         private const val NON_JSON_MESSAGE =
             "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
-        // Current token values extracted from /assets/index-D14EYlfC.js charcode arrays
-        private val AUTH_TOKEN = ClientToken("toonlivre-pass", "auth2028xy")
-        private val DECOY_TOKEN = ClientToken("toonlivre-pass", "decoy99xz")
+        // Current fallback values; WebView capture supersedes them when the site rotates again.
+        private val AUTH_TOKEN = ClientToken("x-toon-signature", "t8v_authX9")
+        private val DECOY_TOKEN = ClientToken("x-toon-signature", "t8v_decoy9")
         private const val VERIFY_HEADER = "x-toon-verify"
         private val STANDARD_HEADERS = setOf("x-csrf-token", "x-requested-with", "x-toonlivre-authenticated-user")
         private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
