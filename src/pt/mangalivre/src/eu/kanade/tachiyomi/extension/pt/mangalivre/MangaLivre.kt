@@ -253,12 +253,13 @@ class MangaLivre :
     @Volatile private var cachedDecoyToken: ClientToken? = null
     @Volatile private var cachedVerifyToken: ClientToken? = null
     @Volatile private var webViewUserAgent: String? = null
+    @Volatile private var cachedRouteToken: CachedRouteToken? = null
+    private val routeTokenLock = Any()
 
     /**
-     * The site injects different tokens per endpoint type:
-     *   /chapters  → AUTH_TOKEN  (required to read chapter pages)
-     *   everything else → DECOY_TOKEN  (browse/search/manga-detail endpoints)
-     * Both are encoded in the JS bundle as char-code arrays: $([97,117,...]).
+     * Chapter routes intentionally return 404 without a short-lived token obtained immediately
+     * before the request. Other API routes are currently public and must not receive stale gate
+     * headers from previous ToonLivre versions.
      */
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -266,78 +267,112 @@ class MangaLivre :
             return chain.proceed(originalRequest)
         }
 
-        val isChapter = originalRequest.url.encodedPath.contains("/chapters")
-        val token = selectToken(isChapter)
-        val response = chain.proceed(originalRequest.withClientHeaders(token, cachedVerifyToken))
-        if (!response.requiresTokenRetry(originalRequest)) {
+        val route = originalRequest.chapterRouteReference()
+            ?: return chain.proceed(originalRequest)
+
+        val token = routeToken(route)
+        var response = if (token != null) {
+            chain.proceed(originalRequest.withRouteToken(token))
+        } else {
+            chain.proceed(originalRequest)
+        }
+        if (response.code != 404) {
             return response
         }
 
         response.close()
-        for (candidate in scrapeStaticCandidates()) {
-            if (candidate == token) continue
-            val retry = chain.proceed(originalRequest.withClientHeaders(candidate, cachedVerifyToken))
-            if (!retry.requiresTokenRetry(originalRequest)) {
-                if (isChapter) cachedAuthToken = candidate else cachedDecoyToken = candidate
-                return retry
-            }
-            retry.close()
-        }
-        val readerPath = originalRequest.tag(ReaderPath::class.java)
-        extractTokensViaWebView(readerPath)?.let { tokens ->
-            val webViewToken = tokens.firstOrNull {
-                it.header.contains("toon", ignoreCase = true) &&
-                    !it.header.equals(VERIFY_HEADER, ignoreCase = true) &&
-                    !it.value.contains("decoy", ignoreCase = true)
-            } ?: AUTH_TOKEN
-            val verifyToken = tokens.firstOrNull {
-                it.header.equals(VERIFY_HEADER, ignoreCase = true)
-            }
-            val retry = chain.proceed(originalRequest.withClientHeaders(webViewToken, verifyToken))
-            if (!retry.requiresTokenRetry(originalRequest)) {
-                if (isChapter) cachedAuthToken = webViewToken
-                cachedVerifyToken = verifyToken
-                return retry
-            }
-            retry.close()
-        }
-        val finalResponse = chain.proceed(originalRequest.withClientHeaders(token, cachedVerifyToken))
-        if (isChapter && finalResponse.code == 403) {
-            val fallbackPages = extractPagesViaWebView(readerPath)
-            if (fallbackPages.isNotEmpty()) {
-                val responseBody = PageDto(fallbackPages)
-                    .toJsonString()
-                    .toResponseBody(JSON_MEDIA_TYPE)
-                return finalResponse.newBuilder()
-                    .code(200)
-                    .message("OK (WebView fallback)")
-                    .removeHeader(DATA_KEY_HEADER)
-                    .body(responseBody)
-                    .build()
-                    .also { finalResponse.close() }
+        invalidateRouteToken(route)
+        routeToken(route, forceRefresh = true)?.let { refreshedToken ->
+            response = chain.proceed(originalRequest.withRouteToken(refreshedToken))
+            if (response.code != 404) {
+                return response
             }
         }
-        // DIAGNOSTIC: when a chapter request still 403s after every retry, surface the response
-        // fingerprint in the error message so we can tell an app-token rejection ("aplicativo
-        // oficial" JSON) from a Cloudflare block (Server: cloudflare + cf-mitigated header).
-        if (isChapter && finalResponse.code == 403) {
-            val diag = buildString {
-                append("MangaLivre 403 | server=").append(finalResponse.header("Server") ?: "?")
-                append(" | cf-mitigated=").append(finalResponse.header("cf-mitigated") ?: "-")
-                append(" | ct=").append(finalResponse.header("Content-Type") ?: "?")
-                append(" | ua=").append((deviceUserAgent() ?: "?").take(30))
-                append(" | body=").append(
-                    try {
-                        finalResponse.peekBody(220).string().replace(Regex("\\s+"), " ").take(150)
-                    } catch (_: Exception) {
-                        "?"
-                    },
-                )
-            }
-            finalResponse.close()
-            throw IOException(diag)
+
+        val fallbackPages = extractPagesViaWebView(originalRequest.tag(ReaderPath::class.java))
+        if (fallbackPages.isNotEmpty()) {
+            val fallbackResponse = response.newBuilder()
+                .code(200)
+                .message("OK (WebView fallback)")
+                .removeHeader(DATA_KEY_HEADER)
+                .body(PageDto(fallbackPages).toJsonString().toResponseBody(JSON_MEDIA_TYPE))
+                .build()
+            response.close()
+            return fallbackResponse
         }
-        return finalResponse
+
+        response.close()
+        throw IOException("MangaLivre: token temporário do capítulo rejeitado (404).")
+    }
+
+    private fun Request.chapterRouteReference(): ChapterRouteReference? {
+        val segments = url.pathSegments
+        if (
+            segments.size != 5 ||
+            segments[0] != "api" ||
+            segments[1] != "mangas" ||
+            segments[3] != "chapters"
+        ) {
+            return null
+        }
+        return ChapterRouteReference(segments[2], segments[4])
+    }
+
+    private fun routeToken(
+        route: ChapterRouteReference,
+        forceRefresh: Boolean = false,
+    ): String? {
+        val now = System.currentTimeMillis()
+        if (!forceRefresh) {
+            cachedRouteToken?.takeIf { it.matches(route, now) }?.let { return it.value }
+        }
+
+        return synchronized(routeTokenLock) {
+            val lockedNow = System.currentTimeMillis()
+            if (!forceRefresh) {
+                cachedRouteToken?.takeIf { it.matches(route, lockedNow) }?.let {
+                    return@synchronized it.value
+                }
+            }
+
+            try {
+                val tokenUrl = "$apiUrl/chapter-token/${route.mangaId}/${route.chapterId}"
+                scrapeClient.newCall(GET(tokenUrl, headers)).execute().use { tokenResponse ->
+                    if (!tokenResponse.isSuccessful) return@use null
+                    val dto = tokenResponse.parseAs<RouteTokenDto>()
+                    CachedRouteToken(
+                        route = route,
+                        value = dto.token,
+                        expiresAt = lockedNow + dto.expiresMs - ROUTE_TOKEN_SAFETY_MS,
+                    ).also { cachedRouteToken = it }.value
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun invalidateRouteToken(route: ChapterRouteReference) {
+        synchronized(routeTokenLock) {
+            if (cachedRouteToken?.route == route) cachedRouteToken = null
+        }
+    }
+
+    private fun Request.withRouteToken(token: String): Request =
+        newBuilder().header(ROUTE_TOKEN_HEADER, token).build()
+
+    private data class ChapterRouteReference(
+        val mangaId: String,
+        val chapterId: String,
+    )
+
+    private data class CachedRouteToken(
+        val route: ChapterRouteReference,
+        val value: String,
+        val expiresAt: Long,
+    ) {
+        fun matches(other: ChapterRouteReference, now: Long): Boolean =
+            route == other && now < expiresAt
     }
 
     private fun selectToken(isChapter: Boolean): ClientToken =
@@ -545,6 +580,8 @@ class MangaLivre :
         private const val RABBIT_PASSPHRASE_PREFIX = "Dealer-Critter-Catnip4"
         private const val RABBIT_SITE_SALT = "toonlivre.tv::v8"
         private const val RABBIT_BUILD_SALT = "t17_4v19_b2"
+        private const val ROUTE_TOKEN_HEADER = "x-toon-route-token"
+        private const val ROUTE_TOKEN_SAFETY_MS = 5_000L
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
