@@ -83,6 +83,12 @@ class ChapterReferenceDto(
 )
 
 @Serializable
+class RouteTokenDto(
+    val token: String,
+    val expiresMs: Long,
+)
+
+@Serializable
 class ChapterDto(
     val id: String,
     val number: String,
