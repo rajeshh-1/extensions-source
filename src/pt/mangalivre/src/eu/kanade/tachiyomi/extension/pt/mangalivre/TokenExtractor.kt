@@ -24,6 +24,7 @@ object TokenExtractor {
     private const val WEBVIEW_HEIGHT = 1920
     private const val COOKIE_TIMEOUT_SECONDS = 12L
     private const val COOKIE_POLL_MS = 250L
+    private const val WEBVIEW_API_TIMEOUT_SECONDS = 15L
 
     private val STANDARD_HEADER_NAMES = setOf(
         "accept", "accept-language", "accept-encoding", "content-type", "content-length",
@@ -137,6 +138,110 @@ object TokenExtractor {
         }
 
         if (!latch.await(COOKIE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            latch.countDown()
+        }
+        handler.post {
+            webView?.stopLoading()
+            webView?.destroy()
+        }
+        return result
+    }
+
+    /**
+     * Executes the protected token + chapter flow inside WebView itself. This avoids differences
+     * between Android WebView cookies and Mihon's OkHttp CookieJar on devices where the server
+     * binds the route token to the browser interaction session.
+     */
+    @Synchronized
+    @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
+    fun fetchChapterPages(
+        siteUrl: String,
+        mangaId: String,
+        chapterId: String,
+        userAgent: String? = null,
+    ): List<String> {
+        val context = Injekt.get<Application>()
+        val handler = Handler(Looper.getMainLooper())
+        val latch = CountDownLatch(1)
+        var result: List<String> = emptyList()
+        var webView: WebView? = null
+
+        handler.post {
+            try {
+                val view = WebView(context)
+                webView = view
+                with(view.settings) {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    if (!userAgent.isNullOrBlank()) userAgentString = userAgent
+                }
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(view, true)
+                }
+                view.addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun onPages(serialized: String) {
+                            val pages = IMAGE_URL_REGEX.findAll(serialized)
+                                .map { it.value.replace("\\/", "/") }
+                                .distinct()
+                                .toList()
+                            if (pages.isNotEmpty()) {
+                                result = pages
+                                latch.countDown()
+                            }
+                        }
+                    },
+                    "PageBridge",
+                )
+
+                val script = """
+                    (async function() {
+                        try {
+                            const tokenResponse = await fetch(
+                                '/api/chapter-token/$mangaId/$chapterId',
+                                {credentials: 'include'}
+                            );
+                            if (!tokenResponse.ok) return;
+                            const tokenData = await tokenResponse.json();
+                            if (!tokenData || !tokenData.token) return;
+                            const chapterResponse = await fetch(
+                                '/api/mangas/$mangaId/chapters/$chapterId',
+                                {
+                                    credentials: 'include',
+                                    headers: {'x-toon-route-token': tokenData.token}
+                                }
+                            );
+                            if (!chapterResponse.ok) return;
+                            const chapterData = await chapterResponse.json();
+                            PageBridge.onPages(JSON.stringify(chapterData.pages || []));
+                        } catch (_) {}
+                    })();
+                """.trimIndent()
+
+                view.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        // toon_i is created after the site's interaction timer. Retry once in case
+                        // the first evaluation races that timer on slower WebView implementations.
+                        listOf(4_000L, 7_000L).forEach { delay ->
+                            handler.postDelayed(
+                                {
+                                    if (latch.count > 0L) view.evaluateJavascript(script, null)
+                                },
+                                delay,
+                            )
+                        }
+                    }
+                }
+                view.loadUrl(siteUrl)
+            } catch (_: Throwable) {
+                latch.countDown()
+            }
+        }
+
+        if (!latch.await(WEBVIEW_API_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             latch.countDown()
         }
         handler.post {
