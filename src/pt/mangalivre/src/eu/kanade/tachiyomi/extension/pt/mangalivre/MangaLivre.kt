@@ -177,7 +177,10 @@ class MangaLivre :
                 .parseAs<PageDto>()
                 .toPageList()
         } catch (apiError: Exception) {
-            extractPagesViaWebView(response.request.tag(ReaderPath::class.java))
+            extractPagesViaWebView(
+                readerPath = response.request.tag(ReaderPath::class.java),
+                route = response.request.chapterRouteReference(),
+            )
                 .takeIf { it.isNotEmpty() }
                 ?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
                 ?: throw IOException("MangaLivre: API alterada e fallback WebView sem páginas.", apiError)
@@ -291,7 +294,10 @@ class MangaLivre :
             }
         }
 
-        val fallbackPages = extractPagesViaWebView(originalRequest.tag(ReaderPath::class.java))
+        val fallbackPages = extractPagesViaWebView(
+            readerPath = originalRequest.tag(ReaderPath::class.java),
+            route = route,
+        )
         if (fallbackPages.isNotEmpty()) {
             val fallbackResponse = response.newBuilder()
                 .code(200)
@@ -343,6 +349,9 @@ class MangaLivre :
                 val tokenUrl = "$apiUrl/chapter-token/${route.mangaId}/${route.chapterId}"
                 val tokenHeaders = headers.newBuilder().apply {
                     deviceUserAgent()?.let { set("User-Agent", it) }
+                    cachedInteractionCookie?.let {
+                        set("Cookie", "$INTERACTION_COOKIE=$it")
+                    }
                 }.build()
                 scrapeClient.newCall(GET(tokenUrl, tokenHeaders)).execute().use { tokenResponse ->
                     if (!tokenResponse.isSuccessful) return@use null
@@ -390,7 +399,12 @@ class MangaLivre :
 
     private fun Request.withRouteToken(token: String): Request = newBuilder()
         .header(ROUTE_TOKEN_HEADER, token)
-        .apply { deviceUserAgent()?.let { header("User-Agent", it) } }
+        .apply {
+            deviceUserAgent()?.let { header("User-Agent", it) }
+            cachedInteractionCookie?.let {
+                header("Cookie", "$INTERACTION_COOKIE=$it")
+            }
+        }
         .build()
 
     private data class ChapterRouteReference(
@@ -566,11 +580,24 @@ class MangaLivre :
         null
     }
 
-    private fun extractPagesViaWebView(readerPath: ReaderPath?): List<String> = try {
+    private fun extractPagesViaWebView(
+        readerPath: ReaderPath?,
+        route: ChapterRouteReference? = null,
+    ): List<String> {
         val pageUrl = readerPath?.let { "$baseUrl${it.path}" } ?: return emptyList()
-        TokenExtractor.extractPages(pageUrl, deviceUserAgent())
-    } catch (_: Exception) {
-        emptyList()
+        return try {
+            if (route != null) {
+                TokenExtractor.fetchChapterPages(
+                    siteUrl = pageUrl,
+                    mangaId = route.mangaId,
+                    chapterId = route.chapterId,
+                    userAgent = deviceUserAgent(),
+                ).takeIf { it.isNotEmpty() }?.let { return it }
+            }
+            TokenExtractor.extractPages(pageUrl, deviceUserAgent())
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun Response.isHtmlResponse(): Boolean = try {
