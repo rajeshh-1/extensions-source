@@ -254,7 +254,9 @@ class MangaLivre :
     @Volatile private var cachedVerifyToken: ClientToken? = null
     @Volatile private var webViewUserAgent: String? = null
     @Volatile private var cachedRouteToken: CachedRouteToken? = null
+    @Volatile private var cachedInteractionCookie: String? = null
     private val routeTokenLock = Any()
+    private val interactionCookieLock = Any()
 
     /**
      * Chapter routes intentionally return 404 without a short-lived token obtained immediately
@@ -327,6 +329,8 @@ class MangaLivre :
             cachedRouteToken?.takeIf { it.matches(route, now) }?.let { return it.value }
         }
 
+        if (interactionCookie(forceRefresh) == null) return null
+
         return synchronized(routeTokenLock) {
             val lockedNow = System.currentTimeMillis()
             if (!forceRefresh) {
@@ -337,7 +341,10 @@ class MangaLivre :
 
             try {
                 val tokenUrl = "$apiUrl/chapter-token/${route.mangaId}/${route.chapterId}"
-                scrapeClient.newCall(GET(tokenUrl, headers)).execute().use { tokenResponse ->
+                val tokenHeaders = headers.newBuilder().apply {
+                    deviceUserAgent()?.let { set("User-Agent", it) }
+                }.build()
+                scrapeClient.newCall(GET(tokenUrl, tokenHeaders)).execute().use { tokenResponse ->
                     if (!tokenResponse.isSuccessful) return@use null
                     val dto = tokenResponse.parseAs<RouteTokenDto>()
                     CachedRouteToken(
@@ -352,14 +359,39 @@ class MangaLivre :
         }
     }
 
+    private fun interactionCookie(forceRefresh: Boolean): String? {
+        if (!forceRefresh) cachedInteractionCookie?.let { return it }
+        return synchronized(interactionCookieLock) {
+            if (!forceRefresh) cachedInteractionCookie?.let { return@synchronized it }
+            TokenExtractor.extractCookie(
+                siteUrl = baseUrl,
+                cookieName = INTERACTION_COOKIE,
+                userAgent = deviceUserAgent(),
+                clearExisting = forceRefresh,
+            )?.also { value ->
+                val cookie = Cookie.Builder()
+                    .name(INTERACTION_COOKIE)
+                    .value(value)
+                    .domain(baseUrlHost)
+                    .path("/")
+                    .expiresAt(System.currentTimeMillis() + INTERACTION_COOKIE_MAX_AGE_MS)
+                    .build()
+                network.client.cookieJar.saveFromResponse(baseUrl.toHttpUrl(), listOf(cookie))
+                cachedInteractionCookie = value
+            }
+        }
+    }
+
     private fun invalidateRouteToken(route: ChapterRouteReference) {
         synchronized(routeTokenLock) {
             if (cachedRouteToken?.route == route) cachedRouteToken = null
         }
     }
 
-    private fun Request.withRouteToken(token: String): Request =
-        newBuilder().header(ROUTE_TOKEN_HEADER, token).build()
+    private fun Request.withRouteToken(token: String): Request = newBuilder()
+        .header(ROUTE_TOKEN_HEADER, token)
+        .apply { deviceUserAgent()?.let { header("User-Agent", it) } }
+        .build()
 
     private data class ChapterRouteReference(
         val mangaId: String,
@@ -582,6 +614,8 @@ class MangaLivre :
         private const val RABBIT_BUILD_SALT = "t17_4v19_b2"
         private const val ROUTE_TOKEN_HEADER = "x-toon-route-token"
         private const val ROUTE_TOKEN_SAFETY_MS = 5_000L
+        private const val INTERACTION_COOKIE = "toon_i"
+        private const val INTERACTION_COOKIE_MAX_AGE_MS = 365L * 24 * 60 * 60 * 1_000
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
