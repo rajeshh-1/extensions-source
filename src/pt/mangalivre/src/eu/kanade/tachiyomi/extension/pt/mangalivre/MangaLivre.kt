@@ -262,8 +262,10 @@ class MangaLivre :
     @Volatile private var cachedVerifyToken: ClientToken? = null
     @Volatile private var webViewUserAgent: String? = null
     @Volatile private var cachedRouteToken: CachedRouteToken? = null
-    @Volatile private var cachedInteractionCookie: String? = null
+    @Volatile private var cachedSeedToken: CachedSeedToken? = null
+    @Volatile private var cachedInteractionCookies: InteractionCookies? = null
     private val routeTokenLock = Any()
+    private val seedTokenLock = Any()
     private val interactionCookieLock = Any()
 
     /**
@@ -280,21 +282,22 @@ class MangaLivre :
         val route = originalRequest.chapterRouteReference()
             ?: return chain.proceed(originalRequest)
 
-        val token = routeToken(route)
-        var response = if (token != null) {
-            chain.proceed(originalRequest.withRouteToken(token))
+        val authorization = routeAuthorization(route)
+        var response = if (authorization != null) {
+            chain.proceed(originalRequest.withRouteAuthorization(authorization))
         } else {
             chain.proceed(originalRequest)
         }
-        if (response.code != 404) {
+        if (response.code !in ROUTE_GATE_CODES) {
             return response
         }
 
         response.close()
         invalidateRouteToken(route)
-        routeToken(route, forceRefresh = true)?.let { refreshedToken ->
-            response = chain.proceed(originalRequest.withRouteToken(refreshedToken))
-            if (response.code != 404) {
+        invalidateSeedToken()
+        routeAuthorization(route, forceRefresh = true)?.let { refreshedAuthorization ->
+            response = chain.proceed(originalRequest.withRouteAuthorization(refreshedAuthorization))
+            if (response.code !in ROUTE_GATE_CODES) {
                 return response
             }
         }
@@ -315,7 +318,7 @@ class MangaLivre :
         }
 
         response.close()
-        throw IOException("MangaLivre: token temporário do capítulo rejeitado (404).")
+        throw IOException("MangaLivre: autenticação temporária do capítulo rejeitada (HTTP ${response.code}).")
     }
 
     private fun Request.chapterRouteReference(): ChapterRouteReference? {
@@ -331,32 +334,31 @@ class MangaLivre :
         return ChapterRouteReference(segments[2], segments[4])
     }
 
-    private fun routeToken(
+    private fun routeAuthorization(
         route: ChapterRouteReference,
         forceRefresh: Boolean = false,
-    ): String? {
+    ): RouteAuthorization? {
         val now = System.currentTimeMillis()
         if (!forceRefresh) {
-            cachedRouteToken?.takeIf { it.matches(route, now) }?.let { return it.value }
+            cachedRouteToken?.takeIf { it.matches(route, now) }?.let { return it.authorization }
         }
-
-        interactionCookie()
 
         return synchronized(routeTokenLock) {
             val lockedNow = System.currentTimeMillis()
             if (!forceRefresh) {
                 cachedRouteToken?.takeIf { it.matches(route, lockedNow) }?.let {
-                    return@synchronized it.value
+                    return@synchronized it.authorization
                 }
             }
 
+            val interactionCookies = interactionCookies(forceRefresh)
+            val signature = seedToken(forceRefresh) ?: return@synchronized null
             try {
                 val tokenUrl = "$apiUrl/chapter-token/${route.mangaId}/${route.chapterId}"
                 val tokenHeaders = headers.newBuilder().apply {
                     deviceUserAgent()?.let { set("User-Agent", it) }
-                    cachedInteractionCookie?.let {
-                        set("Cookie", "$INTERACTION_COOKIE=$it")
-                    }
+                    set(SIGNATURE_HEADER, signature)
+                    set("Cookie", interactionCookies.headerValue)
                 }.build()
                 scrapeClient.newCall(GET(tokenUrl, tokenHeaders)).execute().use { tokenResponse ->
                     if (!tokenResponse.isSuccessful) return@use null
@@ -364,8 +366,10 @@ class MangaLivre :
                     CachedRouteToken(
                         route = route,
                         value = dto.token,
+                        signature = signature,
+                        interactionCookies = interactionCookies,
                         expiresAt = lockedNow + dto.expiresMs - ROUTE_TOKEN_SAFETY_MS,
-                    ).also { cachedRouteToken = it }.value
+                    ).also { cachedRouteToken = it }.authorization
                 }
             } catch (_: Exception) {
                 null
@@ -374,23 +378,68 @@ class MangaLivre :
     }
 
     /**
-     * ToonLivre creates toon_i locally from a deterministic graphic proof. Generating the same
-     * proof here avoids depending on a hidden WebView, whose timer/cookie store varies between
-     * Android System WebView versions. A fresh proof is generated for every route-token request.
+     * Current ToonLivre builds require both interaction cookies while deployments may overlap:
+     * toon_i is the deterministic graphic proof and toon_v is the newer visitor interaction flag.
      */
-    private fun interactionCookie(): String = synchronized(interactionCookieLock) {
+    private fun interactionCookies(forceRefresh: Boolean): InteractionCookies {
+        if (!forceRefresh) cachedInteractionCookies?.let { return it }
+        return synchronized(interactionCookieLock) {
+            if (!forceRefresh) {
+                cachedInteractionCookies?.let { return@synchronized it }
+            }
+            val now = System.currentTimeMillis()
+            val values = InteractionCookies(
+                proof = ToonInteractionProof.cookie(now),
+                visitor = buildString(VISITOR_COOKIE_LENGTH) {
+                    repeat(VISITOR_COOKIE_LENGTH) {
+                        append(VISITOR_COOKIE_ALPHABET[Random.nextInt(VISITOR_COOKIE_ALPHABET.length)])
+                    }
+                },
+            )
+            val cookies = values.asMap().map { (name, value) ->
+                Cookie.Builder()
+                    .name(name)
+                    .value(value)
+                    .domain(baseUrlHost)
+                    .path("/")
+                    .expiresAt(now + INTERACTION_COOKIE_MAX_AGE_MS)
+                    .build()
+            }
+            network.client.cookieJar.saveFromResponse(baseUrl.toHttpUrl(), cookies)
+            cachedInteractionCookies = values
+            values
+        }
+    }
+
+    private fun seedToken(forceRefresh: Boolean): String? {
         val now = System.currentTimeMillis()
-        val value = ToonInteractionProof.cookie(now)
-        val cookie = Cookie.Builder()
-            .name(INTERACTION_COOKIE)
-            .value(value)
-            .domain(baseUrlHost)
-            .path("/")
-            .expiresAt(now + INTERACTION_COOKIE_MAX_AGE_MS)
-            .build()
-        network.client.cookieJar.saveFromResponse(baseUrl.toHttpUrl(), listOf(cookie))
-        cachedInteractionCookie = value
-        value
+        if (!forceRefresh) {
+            cachedSeedToken?.takeIf { now < it.expiresAt }?.let { return it.value }
+        }
+        return synchronized(seedTokenLock) {
+            val lockedNow = System.currentTimeMillis()
+            if (!forceRefresh) {
+                cachedSeedToken?.takeIf { lockedNow < it.expiresAt }?.let {
+                    return@synchronized it.value
+                }
+            }
+            try {
+                val seedHeaders = headers.newBuilder().apply {
+                    deviceUserAgent()?.let { set("User-Agent", it) }
+                    cachedInteractionCookies?.let { set("Cookie", it.headerValue) }
+                }.build()
+                scrapeClient.newCall(GET("$apiUrl/seed", seedHeaders)).execute().use { response ->
+                    if (!response.isSuccessful) return@use null
+                    val dto = response.parseAs<SeedTokenDto>()
+                    CachedSeedToken(
+                        value = dto.token,
+                        expiresAt = lockedNow + SEED_TOKEN_CACHE_MS,
+                    ).also { cachedSeedToken = it }.value
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     private object ToonInteractionProof {
@@ -511,13 +560,18 @@ class MangaLivre :
         }
     }
 
-    private fun Request.withRouteToken(token: String): Request = newBuilder()
-        .header(ROUTE_TOKEN_HEADER, token)
+    private fun invalidateSeedToken() {
+        synchronized(seedTokenLock) {
+            cachedSeedToken = null
+        }
+    }
+
+    private fun Request.withRouteAuthorization(authorization: RouteAuthorization): Request = newBuilder()
+        .header(SIGNATURE_HEADER, authorization.signature)
+        .header(ROUTE_TOKEN_HEADER, authorization.routeToken)
         .apply {
             deviceUserAgent()?.let { header("User-Agent", it) }
-            cachedInteractionCookie?.let {
-                header("Cookie", "$INTERACTION_COOKIE=$it")
-            }
+            header("Cookie", authorization.interactionCookies.headerValue)
         }
         .build()
 
@@ -529,10 +583,37 @@ class MangaLivre :
     private data class CachedRouteToken(
         val route: ChapterRouteReference,
         val value: String,
+        val signature: String,
+        val interactionCookies: InteractionCookies,
         val expiresAt: Long,
     ) {
+        val authorization get() = RouteAuthorization(value, signature, interactionCookies)
+
         fun matches(other: ChapterRouteReference, now: Long): Boolean =
             route == other && now < expiresAt
+    }
+
+    private data class RouteAuthorization(
+        val routeToken: String,
+        val signature: String,
+        val interactionCookies: InteractionCookies,
+    )
+
+    private data class CachedSeedToken(
+        val value: String,
+        val expiresAt: Long,
+    )
+
+    private data class InteractionCookies(
+        val proof: String,
+        val visitor: String,
+    ) {
+        val headerValue get() = "$PROOF_COOKIE=$proof; $VISITOR_COOKIE=$visitor"
+
+        fun asMap(): Map<String, String> = mapOf(
+            PROOF_COOKIE to proof,
+            VISITOR_COOKIE to visitor,
+        )
     }
 
     private fun selectToken(isChapter: Boolean): ClientToken =
@@ -706,6 +787,7 @@ class MangaLivre :
                     mangaId = route.mangaId,
                     chapterId = route.chapterId,
                     userAgent = deviceUserAgent(),
+                    interactionCookies = cachedInteractionCookies?.asMap().orEmpty(),
                 ).takeIf { it.isNotEmpty() }?.let { return it }
             }
             TokenExtractor.extractPages(pageUrl, deviceUserAgent())
@@ -753,10 +835,16 @@ class MangaLivre :
         private const val RABBIT_PASSPHRASE_PREFIX = "Dealer-Critter-Catnip4"
         private const val RABBIT_SITE_SALT = "toonlivre.tv::v8"
         private const val RABBIT_BUILD_SALT = "t17_4v19_b2"
+        private const val SIGNATURE_HEADER = "x-toon-signature"
         private const val ROUTE_TOKEN_HEADER = "x-toon-route-token"
         private const val ROUTE_TOKEN_SAFETY_MS = 5_000L
-        private const val INTERACTION_COOKIE = "toon_i"
+        private const val SEED_TOKEN_CACHE_MS = 25L * 60 * 1_000
+        private const val PROOF_COOKIE = "toon_i"
+        private const val VISITOR_COOKIE = "toon_v"
+        private const val VISITOR_COOKIE_LENGTH = 26
+        private const val VISITOR_COOKIE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
         private const val INTERACTION_COOKIE_MAX_AGE_MS = 365L * 24 * 60 * 60 * 1_000
+        private val ROUTE_GATE_CODES = setOf(403, 404)
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val MAX_ASSETS = 8
         private const val MAX_POOL = 12
