@@ -25,12 +25,17 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.ByteString.Companion.decodeBase64
+import okio.ByteString.Companion.encodeUtf8
 import java.io.IOException
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.sin
 import kotlin.random.Random
 import kotlin.time.Duration.Companion.seconds
 
@@ -335,7 +340,7 @@ class MangaLivre :
             cachedRouteToken?.takeIf { it.matches(route, now) }?.let { return it.value }
         }
 
-        if (interactionCookie(forceRefresh) == null) return null
+        interactionCookie()
 
         return synchronized(routeTokenLock) {
             val lockedNow = System.currentTimeMillis()
@@ -368,27 +373,136 @@ class MangaLivre :
         }
     }
 
-    private fun interactionCookie(forceRefresh: Boolean): String? {
-        if (!forceRefresh) cachedInteractionCookie?.let { return it }
-        return synchronized(interactionCookieLock) {
-            if (!forceRefresh) cachedInteractionCookie?.let { return@synchronized it }
-            TokenExtractor.extractCookie(
-                siteUrl = baseUrl,
-                cookieName = INTERACTION_COOKIE,
-                userAgent = deviceUserAgent(),
-                clearExisting = forceRefresh,
-            )?.also { value ->
-                val cookie = Cookie.Builder()
-                    .name(INTERACTION_COOKIE)
-                    .value(value)
-                    .domain(baseUrlHost)
-                    .path("/")
-                    .expiresAt(System.currentTimeMillis() + INTERACTION_COOKIE_MAX_AGE_MS)
-                    .build()
-                network.client.cookieJar.saveFromResponse(baseUrl.toHttpUrl(), listOf(cookie))
-                cachedInteractionCookie = value
+    /**
+     * ToonLivre creates toon_i locally from a deterministic graphic proof. Generating the same
+     * proof here avoids depending on a hidden WebView, whose timer/cookie store varies between
+     * Android System WebView versions. A fresh proof is generated for every route-token request.
+     */
+    private fun interactionCookie(): String = synchronized(interactionCookieLock) {
+        val now = System.currentTimeMillis()
+        val value = ToonInteractionProof.cookie(now)
+        val cookie = Cookie.Builder()
+            .name(INTERACTION_COOKIE)
+            .value(value)
+            .domain(baseUrlHost)
+            .path("/")
+            .expiresAt(now + INTERACTION_COOKIE_MAX_AGE_MS)
+            .build()
+        network.client.cookieJar.saveFromResponse(baseUrl.toHttpUrl(), listOf(cookie))
+        cachedInteractionCookie = value
+        value
+    }
+
+    private object ToonInteractionProof {
+        private const val SIZE = 80
+        private const val POINTS = 140
+        private const val SEED_XOR = 858_993_459
+        private const val UINT_MASK = 0xffff_ffffL
+        private const val FNV_OFFSET_BASIS = 2_166_136_261L
+        private const val FNV_PRIME = 16_777_619L
+
+        fun cookie(timestamp: Long): String {
+            val proof = proof(timestamp)
+            return """{"ts":$timestamp,"pow":"$proof"}""".encodeUtf8().base64()
+        }
+
+        internal fun proof(timestamp: Long): String {
+            val random = SiteRandom(timestamp)
+            val pixels = ByteArray(SIZE * SIZE)
+            val points = List(POINTS) {
+                Point3d(
+                    x = random.nextFloat() * 2 - 1,
+                    y = random.nextFloat() * 2 - 1,
+                    z = random.nextFloat() * 2 - 1,
+                )
+            }
+            val angleX = random.nextFloat() * Math.PI * 2
+            val angleY = random.nextFloat() * Math.PI * 2
+            val angleZ = random.nextFloat() * Math.PI * 2
+
+            points.zipWithNext().forEach { (from, to) ->
+                val rotatedFrom = rotate(from, angleX, angleY, angleZ)
+                val rotatedTo = rotate(to, angleX, angleY, angleZ)
+                drawLine(
+                    pixels = pixels,
+                    fromX = project(rotatedFrom.x, rotatedFrom.z),
+                    fromY = project(rotatedFrom.y, rotatedFrom.z),
+                    toX = project(rotatedTo.x, rotatedTo.z),
+                    toY = project(rotatedTo.y, rotatedTo.z),
+                )
+            }
+
+            var hash = FNV_OFFSET_BASIS
+            pixels.forEach { value ->
+                hash = hash xor (value.toInt() and 0xff).toLong()
+                hash = (hash * FNV_PRIME) and UINT_MASK
+            }
+            return hash.toString(16).padStart(8, '0')
+        }
+
+        private fun rotate(point: Point3d, angleX: Double, angleY: Double, angleZ: Double): Point3d {
+            val cosX = cos(angleX)
+            val sinX = sin(angleX)
+            val yAfterX = point.y * cosX - point.z * sinX
+            val zAfterX = point.y * sinX + point.z * cosX
+            val cosY = cos(angleY)
+            val sinY = sin(angleY)
+            val xAfterY = point.x * cosY + zAfterX * sinY
+            val zAfterY = -point.x * sinY + zAfterX * cosY
+            val cosZ = cos(angleZ)
+            val sinZ = sin(angleZ)
+            return Point3d(
+                x = xAfterY * cosZ - yAfterX * sinZ,
+                y = xAfterY * sinZ + yAfterX * cosZ,
+                z = zAfterY,
+            )
+        }
+
+        private fun project(value: Double, depth: Double): Int =
+            floor((value / (depth + 2.6) + 1) * (SIZE / 2.2)).toInt()
+
+        private fun drawLine(
+            pixels: ByteArray,
+            fromX: Int,
+            fromY: Int,
+            toX: Int,
+            toY: Int,
+        ) {
+            var x = fromX
+            var y = fromY
+            val deltaX = abs(toX - x)
+            val deltaY = -abs(toY - y)
+            val stepX = if (x < toX) 1 else -1
+            val stepY = if (y < toY) 1 else -1
+            var error = deltaX + deltaY
+
+            while (true) {
+                if (x in 0 until SIZE && y in 0 until SIZE) {
+                    pixels[y * SIZE + x] = 200.toByte()
+                }
+                if (x == toX && y == toY) break
+                val doubledError = 2 * error
+                if (doubledError >= deltaY) {
+                    error += deltaY
+                    x += stepX
+                }
+                if (doubledError <= deltaX) {
+                    error += deltaX
+                    y += stepY
+                }
             }
         }
+
+        private class SiteRandom(timestamp: Long) {
+            private var state = ((timestamp.toInt() xor SEED_XOR).toLong()) and UINT_MASK
+
+            fun nextFloat(): Double {
+                state = (state * 1_664_525L + 1_013_904_223L) and UINT_MASK
+                return state.toDouble() / 4_294_967_296.0
+            }
+        }
+
+        private data class Point3d(val x: Double, val y: Double, val z: Double)
     }
 
     private fun invalidateRouteToken(route: ChapterRouteReference) {
