@@ -89,6 +89,11 @@ class RouteTokenDto(
 )
 
 @Serializable
+class SeedTokenDto(
+    val token: String,
+)
+
+@Serializable
 class ChapterDto(
     val id: String,
     val number: String,
