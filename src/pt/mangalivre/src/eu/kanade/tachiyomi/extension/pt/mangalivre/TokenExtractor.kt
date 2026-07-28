@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -21,6 +22,8 @@ object TokenExtractor {
     private const val TIMEOUT_SECONDS = 45L
     private const val WEBVIEW_WIDTH = 1080
     private const val WEBVIEW_HEIGHT = 1920
+    private const val COOKIE_TIMEOUT_SECONDS = 12L
+    private const val COOKIE_POLL_MS = 250L
 
     private val STANDARD_HEADER_NAMES = setOf(
         "accept", "accept-language", "accept-encoding", "content-type", "content-length",
@@ -60,6 +63,87 @@ object TokenExtractor {
         }
         latch.await(5, TimeUnit.SECONDS)
         return ua
+    }
+
+    /**
+     * Loads the real site long enough for its interaction proof to be generated, then returns the
+     * requested WebView cookie so OkHttp can use the same session on protected API routes.
+     */
+    @Synchronized
+    @SuppressLint("SetJavaScriptEnabled")
+    fun extractCookie(
+        siteUrl: String,
+        cookieName: String,
+        userAgent: String? = null,
+        clearExisting: Boolean = false,
+    ): String? {
+        val context = Injekt.get<Application>()
+        val handler = Handler(Looper.getMainLooper())
+        val latch = CountDownLatch(1)
+        var result: String? = null
+        var webView: WebView? = null
+
+        handler.post {
+            try {
+                val view = WebView(context)
+                webView = view
+                with(view.settings) {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    if (!userAgent.isNullOrBlank()) userAgentString = userAgent
+                }
+
+                val cookieManager = CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(view, true)
+                }
+                if (clearExisting) {
+                    cookieManager.setCookie(
+                        siteUrl,
+                        "$cookieName=; Path=/; Max-Age=0; SameSite=Lax",
+                    )
+                    cookieManager.flush()
+                }
+
+                fun readCookie(): String? = cookieManager.getCookie(siteUrl)
+                    ?.split(";")
+                    ?.map(String::trim)
+                    ?.firstOrNull { it.startsWith("$cookieName=") }
+                    ?.substringAfter("=")
+                    ?.takeIf(String::isNotBlank)
+
+                val pollCookie = object : Runnable {
+                    override fun run() {
+                        readCookie()?.let {
+                            result = it
+                            latch.countDown()
+                            return
+                        }
+                        if (latch.count > 0L) handler.postDelayed(this, COOKIE_POLL_MS)
+                    }
+                }
+
+                view.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        handler.post(pollCookie)
+                    }
+                }
+                handler.post(pollCookie)
+                view.loadUrl(siteUrl)
+            } catch (_: Throwable) {
+                latch.countDown()
+            }
+        }
+
+        if (!latch.await(COOKIE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            latch.countDown()
+        }
+        handler.post {
+            webView?.stopLoading()
+            webView?.destroy()
+        }
+        return result
     }
 
     @Synchronized
