@@ -159,6 +159,7 @@ object TokenExtractor {
         mangaId: String,
         chapterId: String,
         userAgent: String? = null,
+        interactionCookies: Map<String, String> = emptyMap(),
     ): List<String> {
         val context = Injekt.get<Application>()
         val handler = Handler(Looper.getMainLooper())
@@ -179,6 +180,13 @@ object TokenExtractor {
                 CookieManager.getInstance().apply {
                     setAcceptCookie(true)
                     setAcceptThirdPartyCookies(view, true)
+                    interactionCookies.forEach { (name, value) ->
+                        setCookie(
+                            siteUrl,
+                            "$name=$value; Path=/; Max-Age=31536000; SameSite=Lax",
+                        )
+                    }
+                    flush()
                 }
                 view.addJavascriptInterface(
                     object {
@@ -200,9 +208,19 @@ object TokenExtractor {
                 val script = """
                     (async function() {
                         try {
+                            const seedResponse = await fetch(
+                                '/api/seed',
+                                {credentials: 'include', cache: 'no-store'}
+                            );
+                            if (!seedResponse.ok) return;
+                            const seedData = await seedResponse.json();
+                            if (!seedData || !seedData.token) return;
                             const tokenResponse = await fetch(
                                 '/api/chapter-token/$mangaId/$chapterId',
-                                {credentials: 'include'}
+                                {
+                                    credentials: 'include',
+                                    headers: {'x-toon-signature': seedData.token}
+                                }
                             );
                             if (!tokenResponse.ok) return;
                             const tokenData = await tokenResponse.json();
@@ -211,7 +229,10 @@ object TokenExtractor {
                                 '/api/mangas/$mangaId/chapters/$chapterId',
                                 {
                                     credentials: 'include',
-                                    headers: {'x-toon-route-token': tokenData.token}
+                                    headers: {
+                                        'x-toon-signature': seedData.token,
+                                        'x-toon-route-token': tokenData.token
+                                    }
                                 }
                             );
                             if (!chapterResponse.ok) return;
