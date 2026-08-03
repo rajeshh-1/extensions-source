@@ -21,6 +21,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -184,7 +185,6 @@ class MangaLivre :
         } catch (apiError: Exception) {
             extractPagesViaWebView(
                 readerPath = response.request.tag(ReaderPath::class.java),
-                route = response.request.chapterRouteReference(),
             )
                 .takeIf { it.isNotEmpty() }
                 ?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
@@ -267,11 +267,12 @@ class MangaLivre :
     private val routeTokenLock = Any()
     private val seedTokenLock = Any()
     private val interactionCookieLock = Any()
+    private val readerPagesLock = Any()
+    private val readerPagesCache = mutableMapOf<ChapterRouteReference, CachedReaderPages>()
 
     /**
-     * Chapter routes intentionally return 404 without a short-lived token obtained immediately
-     * before the request. Other API routes are currently public and must not receive stale gate
-     * headers from previous ToonLivre versions.
+     * The current reader obtains a short-lived grant through Cloudflare Turnstile inside the site.
+     * Let the WebView complete that flow and return the rendered page URLs as a synthetic response.
      */
     private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -281,44 +282,38 @@ class MangaLivre :
 
         val route = originalRequest.chapterRouteReference()
             ?: return chain.proceed(originalRequest)
-
-        val authorization = routeAuthorization(route)
-        var response = if (authorization != null) {
-            chain.proceed(originalRequest.withRouteAuthorization(authorization))
-        } else {
-            chain.proceed(originalRequest)
+        val now = System.currentTimeMillis()
+        val cachedPages = synchronized(readerPagesLock) {
+            readerPagesCache[route]
+                ?.takeIf { now < it.expiresAt }
+                ?.pages
         }
-        if (response.code !in ROUTE_GATE_CODES) {
-            return response
-        }
-
-        response.close()
-        invalidateRouteToken(route)
-        invalidateSeedToken()
-        routeAuthorization(route, forceRefresh = true)?.let { refreshedAuthorization ->
-            response = chain.proceed(originalRequest.withRouteAuthorization(refreshedAuthorization))
-            if (response.code !in ROUTE_GATE_CODES) {
-                return response
+        val pages = cachedPages ?: extractPagesViaWebView(
+            readerPath = originalRequest.tag(ReaderPath::class.java),
+        ).also { extracted ->
+            if (extracted.isNotEmpty()) {
+                synchronized(readerPagesLock) {
+                    readerPagesCache[route] = CachedReaderPages(
+                        pages = extracted,
+                        expiresAt = System.currentTimeMillis() + READER_PAGES_CACHE_MS,
+                    )
+                }
             }
         }
-
-        val fallbackPages = extractPagesViaWebView(
-            readerPath = originalRequest.tag(ReaderPath::class.java),
-            route = route,
-        )
-        if (fallbackPages.isNotEmpty()) {
-            val fallbackResponse = response.newBuilder()
-                .code(200)
-                .message("OK (WebView fallback)")
-                .removeHeader(DATA_KEY_HEADER)
-                .body(PageDto(fallbackPages).toJsonString().toResponseBody(JSON_MEDIA_TYPE))
-                .build()
-            response.close()
-            return fallbackResponse
+        if (pages.isEmpty()) {
+            throw IOException(
+                "MangaLivre: a verificação Turnstile do leitor não foi concluída. " +
+                    "Abra a fonte na WebView, aguarde as páginas aparecerem e tente novamente.",
+            )
         }
 
-        response.close()
-        throw IOException("MangaLivre: autenticação temporária do capítulo rejeitada (HTTP ${response.code}).")
+        return Response.Builder()
+            .request(originalRequest)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK (Turnstile WebView)")
+            .body(PageDto(pages).toJsonString().toResponseBody(JSON_MEDIA_TYPE))
+            .build()
     }
 
     private fun Request.chapterRouteReference(): ChapterRouteReference? {
@@ -580,6 +575,11 @@ class MangaLivre :
         val chapterId: String,
     )
 
+    private data class CachedReaderPages(
+        val pages: List<String>,
+        val expiresAt: Long,
+    )
+
     private data class CachedRouteToken(
         val route: ChapterRouteReference,
         val value: String,
@@ -777,20 +777,12 @@ class MangaLivre :
 
     private fun extractPagesViaWebView(
         readerPath: ReaderPath?,
-        route: ChapterRouteReference? = null,
     ): List<String> {
         val pageUrl = readerPath?.let { "$baseUrl${it.path}" } ?: return emptyList()
         return try {
-            if (route != null) {
-                TokenExtractor.fetchChapterPages(
-                    siteUrl = pageUrl,
-                    mangaId = route.mangaId,
-                    chapterId = route.chapterId,
-                    userAgent = deviceUserAgent(),
-                    interactionCookies = cachedInteractionCookies?.asMap().orEmpty(),
-                ).takeIf { it.isNotEmpty() }?.let { return it }
-            }
-            TokenExtractor.extractPages(pageUrl, deviceUserAgent())
+            TokenExtractor.fetchChapterPages(
+                siteUrl = pageUrl,
+            )
         } catch (_: Exception) {
             emptyList()
         }
@@ -838,6 +830,7 @@ class MangaLivre :
         private const val SIGNATURE_HEADER = "x-toon-signature"
         private const val ROUTE_TOKEN_HEADER = "x-toon-route-token"
         private const val ROUTE_TOKEN_SAFETY_MS = 5_000L
+        private const val READER_PAGES_CACHE_MS = 5L * 60 * 1_000
         private const val SEED_TOKEN_CACHE_MS = 25L * 60 * 1_000
         private const val PROOF_COOKIE = "toon_i"
         private const val VISITOR_COOKIE = "toon_v"
