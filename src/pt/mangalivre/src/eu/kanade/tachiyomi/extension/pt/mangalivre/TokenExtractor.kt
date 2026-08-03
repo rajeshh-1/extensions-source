@@ -1,7 +1,10 @@
 package eu.kanade.tachiyomi.extension.pt.mangalivre
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.app.Application
+import android.content.Intent
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -24,7 +27,13 @@ object TokenExtractor {
     private const val WEBVIEW_HEIGHT = 1920
     private const val COOKIE_TIMEOUT_SECONDS = 12L
     private const val COOKIE_POLL_MS = 250L
-    private const val WEBVIEW_API_TIMEOUT_SECONDS = 15L
+    private const val WEBVIEW_API_TIMEOUT_SECONDS = 105L
+    private const val WEBVIEW_ATTACH_POLL_MS = 250L
+    private const val WEBVIEW_PAGE_POLL_MS = 1_000L
+    private const val PAGE_LIST_STABLE_MS = 2_000L
+    private const val MIHON_WEBVIEW_ACTIVITY = "eu.kanade.tachiyomi.ui.webview.WebViewActivity"
+    private const val WEBVIEW_URL_KEY = "url_key"
+    private const val WEBVIEW_TITLE_KEY = "title_key"
 
     private val STANDARD_HEADER_NAMES = setOf(
         "accept", "accept-language", "accept-encoding", "content-type", "content-length",
@@ -148,115 +157,137 @@ object TokenExtractor {
     }
 
     /**
-     * Executes the protected token + chapter flow inside WebView itself. This avoids differences
-     * between Android WebView cookies and Mihon's OkHttp CookieJar on devices where the server
-     * binds the route token to the browser interaction session.
+     * Opens Mihon's own WebView so the user can complete Cloudflare Turnstile when required. The
+     * grant stays in the page's JavaScript memory, so poll that same visible WebView and return the
+     * rendered image URLs once the site finishes its reader flow.
      */
     @Synchronized
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    fun fetchChapterPages(
-        siteUrl: String,
-        mangaId: String,
-        chapterId: String,
-        userAgent: String? = null,
-        interactionCookies: Map<String, String> = emptyMap(),
-    ): List<String> {
-        val context = Injekt.get<Application>()
+    fun fetchChapterPages(siteUrl: String): List<String> {
+        val application = Injekt.get<Application>()
         val handler = Handler(Looper.getMainLooper())
         val latch = CountDownLatch(1)
+        val resultLock = Any()
         var result: List<String> = emptyList()
+        var candidateSince = 0L
+        var targetActivity: Activity? = null
         var webView: WebView? = null
+        var attachPoll: Runnable? = null
+        var pagePoll: Runnable? = null
 
+        val bridge = object {
+            @JavascriptInterface
+            fun onPages(serialized: String) {
+                val pages = IMAGE_URL_REGEX.findAll(serialized)
+                    .map { it.value.replace("\\/", "/") }
+                    .distinct()
+                    .toList()
+                if (pages.isEmpty()) return
+                synchronized(resultLock) {
+                    val now = System.currentTimeMillis()
+                    if (pages != result) {
+                        result = pages
+                        candidateSince = now
+                    } else if (now - candidateSince >= PAGE_LIST_STABLE_MS) {
+                        latch.countDown()
+                    }
+                }
+            }
+        }
+
+        val script = """
+            (function() {
+                const normalize = function(value) {
+                    if (!value) return null;
+                    try {
+                        const candidate = new URL(value, location.href);
+                        const nested = candidate.searchParams.get('url');
+                        const target = nested ? new URL(nested, location.href) : candidate;
+                        if (
+                            target.hostname === 'cdn.toonlivre.net' &&
+                            target.pathname.startsWith('/obras/')
+                        ) {
+                            return target.href;
+                        }
+                    } catch (_) {}
+                    return null;
+                };
+                const values = [];
+                document.querySelectorAll('img, source').forEach(function(element) {
+                    ['src','data-src','data-lazy-src','srcset'].forEach(function(attribute) {
+                        const value = element.getAttribute(attribute);
+                        if (!value) return;
+                        value.split(',').forEach(function(part) {
+                            const normalized = normalize(part.trim().split(/\s+/)[0]);
+                            if (normalized) values.push(normalized);
+                        });
+                    });
+                    const current = normalize(element.currentSrc);
+                    if (current) values.push(current);
+                });
+                PageBridge.onPages(JSON.stringify([...new Set(values)]));
+            })();
+        """.trimIndent()
+
+        val callbacks = object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) {
+                if (
+                    activity::class.java.name != MIHON_WEBVIEW_ACTIVITY ||
+                    activity.intent?.getStringExtra(WEBVIEW_URL_KEY) != siteUrl
+                ) {
+                    return
+                }
+                targetActivity = activity
+                attachPoll?.let(handler::post)
+            }
+
+            override fun onActivityDestroyed(activity: Activity) {
+                if (activity === targetActivity && synchronized(resultLock) { result.isEmpty() }) {
+                    latch.countDown()
+                }
+            }
+
+            override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, state: Bundle) = Unit
+        }
+
+        val findAndAttach = object : Runnable {
+            override fun run() {
+                if (latch.count == 0L) return
+                val activity = targetActivity
+                val view = activity?.window?.decorView?.let(::findWebView)
+                if (view == null) {
+                    handler.postDelayed(this, WEBVIEW_ATTACH_POLL_MS)
+                    return
+                }
+                if (webView === view) return
+                webView = view
+                view.addJavascriptInterface(bridge, "PageBridge")
+                val poll = object : Runnable {
+                    override fun run() {
+                        if (latch.count == 0L) return
+                        runCatching { view.evaluateJavascript(script, null) }
+                        handler.postDelayed(this, WEBVIEW_PAGE_POLL_MS)
+                    }
+                }
+                pagePoll = poll
+                handler.post(poll)
+            }
+        }
+        attachPoll = findAndAttach
+
+        application.registerActivityLifecycleCallbacks(callbacks)
         handler.post {
             try {
-                val view = WebView(context)
-                webView = view
-                with(view.settings) {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    if (!userAgent.isNullOrBlank()) userAgentString = userAgent
-                }
-                CookieManager.getInstance().apply {
-                    setAcceptCookie(true)
-                    setAcceptThirdPartyCookies(view, true)
-                    interactionCookies.forEach { (name, value) ->
-                        setCookie(
-                            siteUrl,
-                            "$name=$value; Path=/; Max-Age=31536000; SameSite=Lax",
-                        )
-                    }
-                    flush()
-                }
-                view.addJavascriptInterface(
-                    object {
-                        @JavascriptInterface
-                        fun onPages(serialized: String) {
-                            val pages = IMAGE_URL_REGEX.findAll(serialized)
-                                .map { it.value.replace("\\/", "/") }
-                                .distinct()
-                                .toList()
-                            if (pages.isNotEmpty()) {
-                                result = pages
-                                latch.countDown()
-                            }
-                        }
-                    },
-                    "PageBridge",
-                )
-
-                val script = """
-                    (async function() {
-                        try {
-                            const seedResponse = await fetch(
-                                '/api/seed',
-                                {credentials: 'include', cache: 'no-store'}
-                            );
-                            if (!seedResponse.ok) return;
-                            const seedData = await seedResponse.json();
-                            if (!seedData || !seedData.token) return;
-                            const tokenResponse = await fetch(
-                                '/api/chapter-token/$mangaId/$chapterId',
-                                {
-                                    credentials: 'include',
-                                    headers: {'x-toon-signature': seedData.token}
-                                }
-                            );
-                            if (!tokenResponse.ok) return;
-                            const tokenData = await tokenResponse.json();
-                            if (!tokenData || !tokenData.token) return;
-                            const chapterResponse = await fetch(
-                                '/api/mangas/$mangaId/chapters/$chapterId',
-                                {
-                                    credentials: 'include',
-                                    headers: {
-                                        'x-toon-signature': seedData.token,
-                                        'x-toon-route-token': tokenData.token
-                                    }
-                                }
-                            );
-                            if (!chapterResponse.ok) return;
-                            const chapterData = await chapterResponse.json();
-                            PageBridge.onPages(JSON.stringify(chapterData.pages || []));
-                        } catch (_) {}
-                    })();
-                """.trimIndent()
-
-                view.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        // toon_i is created after the site's interaction timer. Retry once in case
-                        // the first evaluation races that timer on slower WebView implementations.
-                        listOf(4_000L, 7_000L).forEach { delay ->
-                            handler.postDelayed(
-                                {
-                                    if (latch.count > 0L) view.evaluateJavascript(script, null)
-                                },
-                                delay,
-                            )
-                        }
-                    }
-                }
-                view.loadUrl(siteUrl)
+                val intent = Intent()
+                    .setClassName(application.packageName, MIHON_WEBVIEW_ACTIVITY)
+                    .putExtra(WEBVIEW_URL_KEY, siteUrl)
+                    .putExtra(WEBVIEW_TITLE_KEY, "Verificação do leitor ToonLivre")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                application.startActivity(intent)
             } catch (_: Throwable) {
                 latch.countDown()
             }
@@ -266,10 +297,23 @@ object TokenExtractor {
             latch.countDown()
         }
         handler.post {
-            webView?.stopLoading()
-            webView?.destroy()
+            application.unregisterActivityLifecycleCallbacks(callbacks)
+            attachPoll?.let { handler.removeCallbacks(it) }
+            pagePoll?.let { handler.removeCallbacks(it) }
+            if (synchronized(resultLock) { result.isNotEmpty() }) {
+                targetActivity?.finish()
+            }
         }
-        return result
+        return synchronized(resultLock) { result }
+    }
+
+    private fun findWebView(view: View): WebView? {
+        if (view is WebView) return view
+        if (view !is ViewGroup) return null
+        for (index in 0 until view.childCount) {
+            findWebView(view.getChildAt(index))?.let { return it }
+        }
+        return null
     }
 
     @Synchronized
