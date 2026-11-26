@@ -58,6 +58,7 @@ class MangaLivre :
 
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(::clientHeaderInterceptor)
+        .addNetworkInterceptor(::checkSourceRedirect)
         .rateLimit(2, 1.seconds) { it.host == baseUrlHost }
         .build()
 
@@ -160,6 +161,8 @@ class MangaLivre :
     override fun chapterListParse(response: Response): List<SChapter> = response.parseJson<MangaDto>().toSChapterList()
 
     // ============================== Pages =======================================
+
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url.substringBeforeLast("#")}"
 
     override fun pageListRequest(chapter: SChapter): Request {
         val readerPath = chapter.url.substringBeforeLast("#")
@@ -270,6 +273,19 @@ class MangaLivre :
     private val readerPagesLock = Any()
     private val readerPagesCache = mutableMapOf<ChapterRouteReference, CachedReaderPages>()
 
+    private fun checkSourceRedirect(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        if (request.url.host != baseUrlHost || !response.isRedirect) return response
+
+        val destination = response.header("Location")?.let(request.url::resolve)
+        if (destination != null && destination.host in LANDING_PAGE_HOSTS && destination.encodedPath == "/") {
+            response.close()
+            throw IOException("O ToonLivre está redirecionando para a página inicial do Manga Livre, sem catálogo ou capítulos.")
+        }
+        return response
+    }
+
     /**
      * The current reader obtains a short-lived grant through Cloudflare Turnstile inside the site.
      * Let the WebView complete that flow and return the rendered page URLs as a synthetic response.
@@ -288,9 +304,14 @@ class MangaLivre :
                 ?.takeIf { now < it.expiresAt }
                 ?.pages
         }
-        val pages = cachedPages ?: extractPagesViaWebView(
-            readerPath = originalRequest.tag(ReaderPath::class.java),
-        ).also { extracted ->
+        val readerPath = originalRequest.tag(ReaderPath::class.java)
+        val pages = cachedPages ?: run {
+            if (readerPath == null) return chain.proceed(originalRequest)
+
+            // Detect a redirect away from the reader before opening a WebView.
+            chain.proceed(GET("$baseUrl${readerPath.path}", headers)).close()
+            extractPagesViaWebView(readerPath)
+        }.also { extracted ->
             if (extracted.isNotEmpty()) {
                 synchronized(readerPagesLock) {
                     readerPagesCache[route] = CachedReaderPages(
@@ -822,6 +843,7 @@ class MangaLivre :
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
+        private val LANDING_PAGE_HOSTS = setOf("mangalivre.net", "www.mangalivre.net")
         private const val MAX_PEEK = 1024L
         private const val DATA_KEY_HEADER = "x-toon-datakey"
         private const val RABBIT_PASSPHRASE_PREFIX = "Dealer-Critter-Catnip4"
